@@ -1,0 +1,22 @@
+{
+  "name": "audio-usb-studio",
+  "version": "0.1.0-m1",
+  "private": true,
+  "type": "module",
+  "description": "Audio USB Studio - batch audio preparation and non-destructive editing engine for music USB drives",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "cli": "node src/cli/index.ts",
+    "serve": "node src/server/main.ts",
+    "test": "node test/run.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "esbuild": "^0.28.2",
+    "postject": "^1.0.0-alpha.6",
+    "typescript": "^5.9.0"
+  }
+}

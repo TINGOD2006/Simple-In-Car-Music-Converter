@@ -1,0 +1,207 @@
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --panel-2: #23272f;
+  --line: #333a45;
+  --text: #e6e9ef;
+  --muted: #98a2b3;
+  --accent: #4c8dff;
+  --accent-2: #2f6fd0;
+  --ok: #3fbf7f;
+  --warn: #e0a33c;
+  --err: #e0574f;
+  --clip: #2d4a6b;
+  --clip-sel: #3f6fa8;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; margin: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", "Noto Sans TC", system-ui, sans-serif;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: #2c313a; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.primary { background: var(--accent-2); border-color: var(--accent); }
+button.primary:hover:not(:disabled) { background: var(--accent); }
+button.danger { border-color: #6b3330; }
+
+input, select {
+  font: inherit;
+  color: var(--text);
+  background: #12141a;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 4px 6px;
+}
+input[type="range"] { padding: 0; }
+
+.app { display: flex; flex-direction: column; height: 100%; }
+
+.topbar {
+  display: flex; align-items: center; gap: 14px;
+  padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.topbar h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+.tabs { display: flex; gap: 6px; }
+.tabs button.active { background: var(--accent-2); border-color: var(--accent); }
+.spacer { flex: 1; }
+
+.health { font-size: 12px; color: var(--muted); }
+.health.ok { color: var(--ok); }
+.health.bad { color: var(--err); }
+
+.banner {
+  padding: 8px 14px; font-size: 13px; border-bottom: 1px solid var(--line);
+  display: flex; gap: 10px; align-items: center;
+}
+.banner.error { background: #3a1f1e; color: #ffb4ae; }
+.banner.notice { background: #1e2f26; color: #a9e6c6; }
+.banner button { padding: 2px 8px; }
+
+.body { flex: 1; overflow: auto; padding: 14px; }
+.row { display: flex; gap: 12px; }
+.col { display: flex; flex-direction: column; gap: 10px; }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+}
+.panel h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .6px; }
+.panel h3 { font-size: 13px; margin: 10px 0 6px; }
+
+.toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.toolbar .sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
+
+.field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.field input, .field select { min-width: 150px; }
+.inline { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; }
+tr.ok td.status { color: var(--ok); }
+tr.failed td.status { color: var(--err); }
+tr.skipped td.status { color: var(--warn); }
+
+.muted { color: var(--muted); }
+.mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
+.tiny { font-size: 11px; }
+.pill {
+  display: inline-block; padding: 1px 7px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line); font-size: 11px;
+}
+
+.progress { height: 10px; background: #12141a; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.progress > div { height: 100%; background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
+
+.cliplist { display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow: auto; }
+.cliprow {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 5px; cursor: pointer;
+}
+.cliprow.selected { border-color: var(--accent); background: #24344a; }
+.cliprow .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.effectcard { border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: var(--panel-2); }
+.effectcard + .effectcard { margin-top: 6px; }
+.effectcard .head { display: flex; align-items: center; gap: 8px; }
+.effectcard .params { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.effectcard.disabled { opacity: 0.55; }
+
+.band { display: flex; gap: 6px; align-items: center; margin-top: 4px; }
+.band input { width: 74px; }
+
+.hint { font-size: 12px; color: var(--muted); }
+.kbd { font-family: Consolas, monospace; background: #12141a; border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+
+.legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 4px; }
+
+/* ------------------------------------------------------------------ */
+/* Intake: onboarding, drop target, spinners, error list               */
+/* ------------------------------------------------------------------ */
+
+/* Used by the banners and every "push the rest to the right" row. */
+.grow { flex: 1; min-width: 0; }
+
+.spinner {
+  display: inline-block; width: 12px; height: 12px; flex: 0 0 auto;
+  border: 2px solid var(--line); border-top-color: var(--accent);
+  border-radius: 50%; animation: aus-spin .7s linear infinite;
+  vertical-align: -2px;
+}
+@keyframes aus-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 2.4s; }
+}
+
+.busy-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--accent);
+}
+
+/* --- error list: one dismissible row per failure ------------------- */
+.errlist { flex-direction: column; align-items: stretch; gap: 4px; padding: 8px 14px 10px; }
+.errhead { display: flex; align-items: center; gap: 10px; }
+.errrow { display: flex; align-items: flex-start; gap: 10px; }
+.errmsg { white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.45; }
+
+/* --- onboarding ---------------------------------------------------- */
+.onboarding { border-color: var(--accent-2); }
+.onboarding.armed { border-color: var(--accent); }
+.onb-lead { margin: 0 0 12px; font-size: 13px; line-height: 1.6; max-width: 78ch; }
+
+.onb-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.big-btn {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  min-width: 226px; max-width: 320px; padding: 14px 16px; text-align: left;
+  border-radius: 10px; font-size: 15px; line-height: 1.3; cursor: pointer;
+}
+.big-btn .big-title { font-weight: 600; }
+.big-btn .sub { font-size: 11px; font-weight: 400; color: var(--muted); white-space: normal; }
+.big-btn.primary .sub { color: #cfe0ff; }
+
+.dropzone { border: 1px dashed var(--line); background: var(--panel-2); position: relative; }
+.dropzone:hover { border-color: var(--accent); background: #232d3d; }
+.dropzone.armed { border-color: var(--accent); border-style: solid; background: #24344a; }
+/* Focusable but invisible: the whole label is the click target. */
+.dropzone input[type="file"] {
+  position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;
+}
+
+.onb-busy { display: flex; align-items: center; gap: 8px; margin: 12px 0 0; font-size: 13px; color: var(--accent); }
+.onb-warn {
+  margin: 12px 0 0; padding: 8px 10px; font-size: 12px; line-height: 1.5;
+  background: #3a2f1e; color: #ffd9a1; border: 1px solid #6b5426; border-radius: 6px;
+}
+.onboarding .hint { margin: 12px 0 0; line-height: 1.6; }
+.onb-manual { margin-top: 12px; font-size: 12px; color: var(--muted); }
+.onb-manual summary { cursor: pointer; }
+.onb-manual button { margin-top: 8px; }
+
+/* --- whole-window drop overlay ------------------------------------- */
+.drop-overlay {
+  position: fixed; inset: 0; z-index: 60; pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(12, 14, 18, 0.82);
+  border: 3px dashed var(--accent);
+}
+.drop-overlay-card {
+  background: var(--panel); border: 1px solid var(--accent); border-radius: 12px;
+  padding: 22px 28px; text-align: center; max-width: 520px;
+}
+.drop-overlay-title { font-size: 20px; font-weight: 600; margin-bottom: 6px; }

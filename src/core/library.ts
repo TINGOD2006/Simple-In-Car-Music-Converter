@@ -1,0 +1,206 @@
+/**
+ * Library scanning: turn a messy folder tree into a list of probed audio entries.
+ *
+ * Design notes:
+ *  - Scanning is *read-only*: nothing here moves, renames or rewrites a file. The
+ *    library is an index; decisions about what to do with it belong to the batch
+ *    planner.
+ *  - Every file is probed with `probe()`, which exchanges data through files
+ *    rather than a stdout pipe (see ffbin.ts for why).
+ *  - A file that cannot be probed never aborts the scan: it lands in `errors`
+ *    and the walk continues. A music library with one broken file must still be
+ *    usable.
+ */
+
+import { createHash } from 'node:crypto';
+import { mkdirSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { extname, isAbsolute, join, normalize, resolve } from 'node:path';
+import { probe } from './probe.ts';
+import type { MediaInfo } from './types.ts';
+
+/**
+ * Audio container/codec extensions the scanner accepts by default.
+ *
+ * Deliberately broad: a car stereo library collected over years contains every
+ * format the owner ever ripped or downloaded, so the scanner must recognise them
+ * all and let `probe()` decide whether the content is actually decodable.
+ */
+export const AUDIO_EXTENSIONS: string[] = [
+  'mp3', 'wav', 'flac', 'ogg', 'oga', 'opus', 'aac', 'm4a', 'mp4',
+  'wma', 'aiff', 'aif', 'alac', 'ape', 'wv', 'tta', 'ac3', 'dts',
+  'mka', 'amr', 'au', 'ra', 'rm', 'caf', 'mpc', 'spx',
+  // Common cousins that show up in real collections.
+  'mp2', 'm4b', 'm4r', 'asf', 'oga', 'weba', 'dff', 'dsf',
+];
+
+const EXT_SET: Set<string> = new Set(AUDIO_EXTENSIONS.map((e) => `.${e.toLowerCase()}`));
+
+/** True when the path's extension is a recognised audio container. */
+export function isAudioFile(p: string): boolean {
+  return EXT_SET.has(extname(p).toLowerCase());
+}
+
+export interface LibraryEntry {
+  /** Stable id derived from the absolute path; stable across scans. */
+  id: string;
+  path: string;
+  info: MediaInfo;
+  /**
+   * Acoustic fingerprint, filled in by the batch analyser when dedup is requested.
+   * Absent means "not computed"; `null` means "computed and unavailable".
+   */
+  fp?: string | null;
+}
+
+export interface ScanResult {
+  entries: LibraryEntry[];
+  errors: { path: string; message: string }[];
+}
+
+/**
+ * Stable, collision-resistant id for a path.
+ *
+ * Hashing the normalised absolute path (rather than using the path itself as the
+ * id) keeps ids short in reports and manifests while staying deterministic, so
+ * re-scanning the same tree yields the same ids and a saved manifest still
+ * matches.
+ */
+export function entryId(path: string): string {
+  const abs = isAbsolute(path) ? path : resolve(path);
+  const norm = normalize(abs).replace(/\\/g, '/').toLowerCase();
+  return 'L' + createHash('sha1').update(norm).digest('hex').slice(0, 12);
+}
+
+/**
+ * Create a directory, tolerating sandboxes that deny `mkdir`.
+ *
+ * Returns the path either way: a caller that gets the path back and then fails to
+ * write into it will surface a clearer error than one that threw during setup.
+ */
+export function ensureDir(dir: string): string {
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    /* Some sandboxes deny mkdir; the caller may already have created it. */
+  }
+  return dir;
+}
+
+/* ------------------------------------------------------------------ */
+/* Walking                                                             */
+/* ------------------------------------------------------------------ */
+
+function walk(
+  dir: string,
+  exts: Set<string>,
+  recursive: boolean,
+  out: string[],
+  errors: { path: string; message: string }[],
+  visited: Set<string>,
+): void {
+  let dirents;
+  try {
+    dirents = readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    errors.push({ path: dir, message: (err as Error).message });
+    return;
+  }
+
+  for (const d of dirents) {
+    const full = join(dir, d.name);
+    let isDir = d.isDirectory();
+    let isFile = d.isFile();
+    if (d.isSymbolicLink()) {
+      // Follow links only if they resolve to a real file/dir, and never twice:
+      // a link loop would otherwise make the walk non-terminating.
+      try {
+        const real = realpathSync(full);
+        if (visited.has(real)) continue;
+        visited.add(real);
+        const st = statSync(full);
+        isDir = st.isDirectory();
+        isFile = st.isFile();
+      } catch (err) {
+        errors.push({ path: full, message: (err as Error).message });
+        continue;
+      }
+    }
+
+    if (isDir) {
+      if (!recursive) continue;
+      if (!d.isSymbolicLink()) {
+        let real = full;
+        try {
+          real = realpathSync(full);
+        } catch {
+          /* keep the plain path */
+        }
+        if (visited.has(real)) continue;
+        visited.add(real);
+      }
+      walk(full, exts, recursive, out, errors, visited);
+    } else if (isFile) {
+      if (exts.has(extname(d.name).toLowerCase())) out.push(full);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Scanning                                                            */
+/* ------------------------------------------------------------------ */
+
+export interface ScanOptions {
+  roots: string[];
+  ffprobe: string;
+  scratch: string;
+  /** Extension allow-list (with or without the leading dot). Defaults to AUDIO_EXTENSIONS. */
+  extensions?: string[];
+  /** Recurse into subdirectories. Defaults to true. */
+  recursive?: boolean;
+  onProgress?: (done: number, total: number, path: string) => void;
+}
+
+/**
+ * Walk every root, probe every audio file, and return what was found.
+ *
+ * Files are probed sequentially and in sorted path order so that progress
+ * reporting and entry ordering are reproducible run to run.
+ */
+export async function scanLibrary(opts: ScanOptions): Promise<ScanResult> {
+  const raw = opts.extensions ?? AUDIO_EXTENSIONS;
+  const exts = new Set(raw.map((e) => (e.startsWith('.') ? e : `.${e}`).toLowerCase()));
+  const recursive = opts.recursive ?? true;
+
+  const errors: { path: string; message: string }[] = [];
+  const files: string[] = [];
+
+  for (const root of opts.roots) {
+    const visited = new Set<string>();
+    try {
+      visited.add(realpathSync(root));
+    } catch {
+      /* root may not exist yet; readdirSync below will report it */
+    }
+    walk(root, exts, recursive, files, errors, visited);
+  }
+
+  files.sort();
+
+  const entries: LibraryEntry[] = [];
+  for (let i = 0; i < files.length; i += 1) {
+    const path = files[i]!;
+    try {
+      const info = await probe(opts.ffprobe, path, opts.scratch);
+      if (!info.audio) {
+        errors.push({ path, message: 'no audio stream' });
+      } else {
+        entries.push({ id: entryId(path), path, info });
+      }
+    } catch (err) {
+      errors.push({ path, message: (err as Error).message });
+    }
+    opts.onProgress?.(i + 1, files.length, path);
+  }
+
+  return { entries, errors };
+}

@@ -1,0 +1,8 @@
+﻿# The DeepFilterNet binary is a 27 MB platform-specific release artifact and must
+# never be committed. Fetch it per machine with:
+#
+#   node tools/fetch-deep-filter.mjs
+#
+# See tools/README.md for the release, size and sha256 to verify against.
+*
+!.gitignore
