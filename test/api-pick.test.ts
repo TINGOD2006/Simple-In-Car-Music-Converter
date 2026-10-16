@@ -17,6 +17,7 @@ import {
   type FetchLike,
 } from '../web/src/api.ts';
 import type { NativeTransport } from '../web/src/native-bridge.ts';
+import { isBridgeTimeout } from '../web/src/native-bridge.ts';
 
 /** The slice of `Response` the api module actually reads. */
 function jsonResponse(status: number, body: unknown): Response {
@@ -92,6 +93,34 @@ test('api-pick: without a bridge the engine dialog is used', async () => {
   const res = await api.pick({ mode: 'files' }, { transport: null, fetchImpl: spy.fetchImpl });
   assertEq(res.paths, ['C:\\engine.mp3'], 'the engine path comes back');
   assertEq(spy.calls, ['/api/pick'], 'the engine route was used exactly once');
+});
+
+test('api-pick: a SILENT bridge must not open a second dialog', async () => {
+  // THE REGRESSION. A bridge timeout used to fall through to POST /api/pick, so a
+  // user who was still browsing their stick got a second folder window stacked on
+  // the first — "I have to choose the folder twice, and then more windows open".
+  // A host that has not answered probably still has its dialog on screen, so the
+  // engine must not be asked at all.
+  const bridge = bridgeAnswering(() => undefined);
+  const spy = fetchSpy({
+    '/api/pick': () => jsonResponse(200, { ok: true, paths: ['C:\\engine.mp3'] }),
+  });
+  let caught: unknown = null;
+  try {
+    await api.pick(
+      { mode: 'folder' },
+      { transport: bridge, fetchImpl: spy.fetchImpl, timeoutMs: 40 },
+    );
+  } catch (err) {
+    caught = err;
+  }
+  assert(caught !== null, 'a silent host must reject rather than hang');
+  assert(isBridgeTimeout(caught), 'the caller can tell a timeout from a missing dialog');
+  assertEq(
+    spy.calls.length,
+    0,
+    'the engine dialog must NOT open while the shell may still have one on screen',
+  );
 });
 
 test('api-pick: a broken bridge still falls back to the engine', async () => {

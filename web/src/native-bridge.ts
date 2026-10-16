@@ -35,8 +35,41 @@ export interface PickOptions {
 /**
  * A dialog is user-paced, so this is deliberately generous: it exists to stop a
  * broken host from hanging a promise forever, not to time the user out.
+ *
+ * Ten minutes, not two. Browsing a full USB stick for the right folder is the
+ * normal case here, and the old two-minute ceiling fired on people who were
+ * simply still looking. It was not harmless: the timeout looked like a failure,
+ * the caller escalated to the engine's own dialog, and the user was left with a
+ * second folder window on top of the first — which reads as "I had to choose the
+ * folder twice, and then more windows kept opening".
  */
-const DEFAULT_TIMEOUT_MS = 120_000;
+export const DEFAULT_BRIDGE_TIMEOUT_MS = 10 * 60_000;
+
+/** Marker carried by {@link BridgeTimeoutError}; callers must not treat it as a missing dialog. */
+export const BRIDGE_TIMEOUT_CODE = 'bridge-timeout';
+
+/**
+ * The host never answered — not "the host has no dialog".
+ *
+ * The distinction is load-bearing. A shell that answers "I cannot show a dialog"
+ * is a reason to fall back to the engine's dialog; a shell that has not answered
+ * yet probably still has one open, and opening a second one is the bug above.
+ */
+export class BridgeTimeoutError extends Error {
+  readonly code = BRIDGE_TIMEOUT_CODE;
+  readonly timeoutMs: number;
+
+  constructor(timeoutMs: number) {
+    super(`native pick timeout after ${timeoutMs}ms: the desktop shell did not answer`);
+    this.name = 'BridgeTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/** True for the "nobody answered" case, which must never trigger a second dialog. */
+export function isBridgeTimeout(err: unknown): boolean {
+  return err instanceof BridgeTimeoutError;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : null;
@@ -97,7 +130,7 @@ export function bridgePick(
   opts: PickOptions = {},
 ): Promise<string[] | null> {
   const id = `pick-${nextId++}`;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
 
   return new Promise<string[] | null>((resolve, reject) => {
     let settled = false;
@@ -113,11 +146,7 @@ export function bridgePick(
     };
 
     timer = setTimeout(() => {
-      finish(() =>
-        reject(
-          new Error(`native pick timeout after ${timeoutMs}ms: the desktop shell did not answer`),
-        ),
-      );
+      finish(() => reject(new BridgeTimeoutError(timeoutMs)));
     }, timeoutMs);
 
     // Subscribe before posting so an answer cannot arrive before anyone listens.

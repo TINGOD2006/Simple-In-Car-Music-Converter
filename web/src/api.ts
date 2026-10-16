@@ -29,7 +29,7 @@ import type {
   WaveformResponse,
 } from './api-types.ts';
 
-import { bridgePick, detectNativeTransport, type NativeTransport } from './native-bridge.ts';
+import { bridgePick, detectNativeTransport, isBridgeTimeout, type NativeTransport } from './native-bridge.ts';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -194,6 +194,9 @@ export const api = {
    *
    * A cancellation is reported as `{ok:true, paths:[]}` on every route, so no
    * caller needs a second shape to tell "cancelled" from "failed".
+   *
+   * Step 2 runs only when step 1 says it cannot help. When step 1 merely goes
+   * quiet, the request stops there — see the timeout branch below.
    */
   async pick(req: PickRequest, deps: PickDeps = {}): Promise<PickResponse> {
     const transport = deps.transport !== undefined ? deps.transport : detectNativeTransport();
@@ -208,8 +211,15 @@ export const api = {
         });
         return { ok: true, paths: paths ?? [] };
       } catch (err) {
-        // The shell is present but broken. That is a reason to fall back, not a
-        // reason to give up: the engine may still have a dialog of its own.
+        // A TIMEOUT IS NOT A MISSING DIALOG.
+        //
+        // The shell has not answered, which usually means its dialog is still on
+        // screen. Escalating here is exactly what put a second folder window on top
+        // of the first and made one pick look like it takes two tries, so a timeout
+        // is reported instead of retried.
+        if (isBridgeTimeout(err)) throw err;
+        // The shell answered that it cannot help. That IS a reason to fall back: the
+        // engine may still have a dialog of its own.
         bridgeFailure = describe(err);
       }
     }

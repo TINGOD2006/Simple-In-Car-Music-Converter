@@ -37,6 +37,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent as ReactDragEvent } from 'react';
 import { api, isNoNativeDialog } from '../api.ts';
+import { isBridgeTimeout } from '../native-bridge.ts';
 import type {
   BatchReport,
   BatchReportItem,
@@ -689,6 +690,10 @@ export default function UsbTab(): JSX.Element {
     setPicking(true);
     try {
       const res = await api.pick({ mode: 'folder', title: '選擇 USB／工作資料夾' });
+      // The dialog is closed by now; only the scan is still to come, and a button
+      // that keeps saying "對話框中…" while scanning sends people looking for a
+      // window that is no longer there.
+      setPicking(false);
       const dir = (res.paths ?? []).find((p) => typeof p === 'string' && p.trim().length > 0);
       // An empty `paths` is a cancelled dialog, not a failure.
       if (!dir) return;
@@ -703,6 +708,15 @@ export default function UsbTab(): JSX.Element {
           '此平台沒有原生資料夾對話框，請改用下面的拖放／瀏覽器選擇：' +
             '檔案會先上傳到引擎的暫存資料夾，再以該資料夾為工作區。',
         );
+      } else if (isBridgeTimeout(err)) {
+        // Do NOT retry with the engine's dialog here: the shell's own folder window
+        // is most likely still open, and a second one is what made a single pick
+        // look like it needs two tries.
+        dispatch({
+          type: 'error',
+          message:
+            '資料夾對話框沒有回應。若畫面上還開著選擇資料夾的視窗，請先關閉它，再按一次「選擇資料夾…」。',
+        });
       } else {
         dispatch({ type: 'error', message: `選擇資料夾失敗：${errText(err)}` });
       }

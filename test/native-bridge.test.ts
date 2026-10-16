@@ -7,8 +7,12 @@
 
 import { assert, assertEq, test } from './harness.ts';
 import {
+  BRIDGE_TIMEOUT_CODE,
+  BridgeTimeoutError,
+  DEFAULT_BRIDGE_TIMEOUT_MS,
   bridgePick,
   detectNativeTransport,
+  isBridgeTimeout,
   type NativeTransport,
 } from '../web/src/native-bridge.ts';
 
@@ -104,6 +108,36 @@ test('native-bridge: silence from the host rejects with a timeout', async () => 
     () => bridgePick(transport, 'files', { timeoutMs: 50 }),
     'timeout',
     'a host that never answers must not hang the UI',
+  );
+});
+
+test('native-bridge: a timeout is distinguishable from a host that cannot help', async () => {
+  // The distinction is what stops one pick from opening two folder windows: a
+  // host that HAS NOT answered probably still has a dialog open, while a host
+  // that answers "I cannot show one" is a reason to try the engine's dialog.
+  const transport = fakeTransport(() => undefined);
+  let caught: unknown = null;
+  try {
+    await bridgePick(transport, 'folder', { timeoutMs: 40 });
+  } catch (err) {
+    caught = err;
+  }
+  assert(caught !== null, 'silence from the host rejects');
+  assert(isBridgeTimeout(caught), 'the timeout carries its own marker');
+  assertEq((caught as BridgeTimeoutError).code, BRIDGE_TIMEOUT_CODE, 'the marker is the exported code');
+
+  assert(
+    !isBridgeTimeout(new Error('the desktop shell could not show a file dialog')),
+    'an ordinary host error is not a timeout',
+  );
+});
+
+test('native-bridge: the default wait outlasts someone browsing a full USB stick', () => {
+  // It was two minutes, which fired on people who were simply still looking. The
+  // retry that followed is what put a second folder window on top of the first.
+  assert(
+    DEFAULT_BRIDGE_TIMEOUT_MS >= 10 * 60_000,
+    `the bridge must wait at least ten minutes (was ${DEFAULT_BRIDGE_TIMEOUT_MS}ms)`,
   );
 });
 
