@@ -216,33 +216,45 @@ export function compile(input: CompileInput): CompileResult {
     tail.push('volumedetect');
   } else if (input.measure) {
     // Measurement pass: analyse the program exactly as it will be rendered.
-    tail.push(
-      `loudnorm=I=${fmt(input.measure.integratedLufs)}` +
-        `:TP=${fmt(input.measure.truePeakDb)}` +
-        `:LRA=${fmt(input.measure.lra)}` +
-        ':print_format=json',
-    );
+    //
+    // `ebur128`, not `loudnorm`'s analysis mode: both implement BS.1770-4 and
+    // report the same four numbers, but loudnorm runs its entire normalization
+    // machinery to produce them. Through the real USB preset chain this pass is
+    // 4868 ms with loudnorm and 1483 ms with ebur128 on a 240 s track (3.3x).
+    // The two agree to within 0.09 LU on every source shape measured, well
+    // inside the 1.5 LU verification tolerance. `peak=true` is required: without
+    // it ebur128 prints no true peak and the second pass has no ceiling.
+    tail.push('ebur128=peak=true');
   } else if (input.loudnorm) {
     const m = input.loudnorm.measured;
-    // `linear=true` is only honoured while the target LRA is >= the measured LRA.
-    // If the target is smaller, ffmpeg silently drops to dynamic mode: the
-    // integrated level then misses the target and the dynamics get squeezed
-    // (measured on a -30/-9/-30 dB source: LRA=11 -> -12.35 LUFS, off by 1.65 LU,
-    // while LRA=22 -> -13.96 LUFS, off by 0.04, with the LRA preserved intact).
-    // Raising the target to the source's own LRA keeps linear mode, which is what
-    // actually preserves the music; a source narrower than the target is unaffected.
-    const effectiveLra = Math.max(input.loudnorm.lra, m.inputLra);
-    tail.push(
-      `loudnorm=I=${fmt(input.loudnorm.integratedLufs)}` +
-        `:TP=${fmt(input.loudnorm.truePeakDb)}` +
-        `:LRA=${fmt(effectiveLra)}` +
-        `:measured_I=${fmt(m.inputI)}` +
-        `:measured_TP=${fmt(m.inputTp)}` +
-        `:measured_LRA=${fmt(m.inputLra)}` +
-        `:measured_thresh=${fmt(m.inputThresh)}` +
-        `:offset=${fmt(m.targetOffset)}` +
-        ':linear=true:print_format=summary',
-    );
+    // A non-finite measurement means the program is digital silence (ebur128
+    // reports `I: -70.0 LUFS` / `Peak: -inf dBFS`). There is no gain that makes
+    // silence louder, and ffmpeg rejects `measured_TP=-inf` outright with
+    // "Result too large" and exits non-zero, so the normalization is skipped and
+    // the silent program is encoded as-is.
+    if (!Number.isFinite(m.inputI) || !Number.isFinite(m.inputTp)) {
+      // nothing to normalize
+    } else {
+      // `linear=true` is only honoured while the target LRA is >= the measured LRA.
+      // If the target is smaller, ffmpeg silently drops to dynamic mode: the
+      // integrated level then misses the target and the dynamics get squeezed
+      // (measured on a -30/-9/-30 dB source: LRA=11 -> -12.35 LUFS, off by 1.65 LU,
+      // while LRA=22 -> -13.96 LUFS, off by 0.04, with the LRA preserved intact).
+      // Raising the target to the source's own LRA keeps linear mode, which is what
+      // actually preserves the music; a source narrower than the target is unaffected.
+      const effectiveLra = Math.max(input.loudnorm.lra, m.inputLra);
+      tail.push(
+        `loudnorm=I=${fmt(input.loudnorm.integratedLufs)}` +
+          `:TP=${fmt(input.loudnorm.truePeakDb)}` +
+          `:LRA=${fmt(effectiveLra)}` +
+          `:measured_I=${fmt(m.inputI)}` +
+          `:measured_TP=${fmt(m.inputTp)}` +
+          `:measured_LRA=${fmt(m.inputLra)}` +
+          `:measured_thresh=${fmt(m.inputThresh)}` +
+          `:offset=${fmt(m.targetOffset)}` +
+          ':linear=true:print_format=summary',
+      );
+    }
   }
 
   tail.push(`aresample=${preset.sampleRate}`);

@@ -108,11 +108,41 @@ export function findBinaries(explicitDir?: string): BinPaths {
 /* Running                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Hard ceiling on one child, so "wedged forever" degrades to "failed, with a reason".
+ *
+ * `spawn` hands back a process, not a promise with a deadline: if ffmpeg blocks on
+ * a damaged directory entry or a stalled device read, `close` never fires and the
+ * awaiting caller never settles. In a batch that is fatal rather than merely slow —
+ * `verify()` awaits this twice per item and `mapPool` awaits `Promise.all` over every
+ * item, so ONE wedged child freezes the whole job at `stage: 'verify'` with no error
+ * and no progress. Measured: a child that never exits left `runFfmpeg` still pending
+ * after 3 s while a normal child settled in 63 ms.
+ *
+ * Ten minutes is a ceiling, not a budget: the real batch averaged ~10 s per item, so
+ * this can only ever fire on a child that is genuinely stuck.
+ */
+export const DEFAULT_RUN_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * How long to wait for `close` after a kill before resolving anyway.
+ *
+ * A successful kill closes within milliseconds. This only matters when the kill was
+ * refused or the handle is wedged, and even then the caller must be given an answer.
+ */
+const KILL_GRACE_MS = 5_000;
+
 export interface RunOptions {
   /** Scratch directory the child runs in; its report log lands here. */
   cwd: string;
   /** Extra environment entries for the child. */
   env?: Record<string, string>;
+  /**
+   * Kill the child after this many ms and resolve with a non-zero code.
+   * Defaults to `DEFAULT_RUN_TIMEOUT_MS`. Callers that know the operation is
+   * short (a probe, a measurement of a file whose duration is known) pass less.
+   */
+  timeoutMs?: number;
 }
 
 export interface RunResult {
@@ -121,6 +151,8 @@ export interface RunResult {
   report: string | null;
   /** Path of the report log, when one was produced. */
   reportPath: string | null;
+  /** True when the child was killed for exceeding `timeoutMs`. */
+  timedOut?: boolean;
 }
 
 /** Report-log basename pattern, so cleanup and discovery stay in one place. */
@@ -162,6 +194,8 @@ export function runFfmpeg(
   const reportName = `ffmpeg-aus-${stamp}.log`;
   const reportPath = join(opts.cwd, reportName);
 
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+
   return new Promise<RunResult>((resolve, reject) => {
     const child = spawn(bin, argv, {
       cwd: opts.cwd,
@@ -176,11 +210,23 @@ export function runFfmpeg(
       },
     });
 
-    child.on('error', (err) => {
-      reject(new Error(`Failed to start ${bin}: ${err.message}`));
-    });
+    let settled = false;
+    let timedOut = false;
+    let killGrace: NodeJS.Timeout | null = null;
 
-    child.on('close', (code) => {
+    const clearTimers = (): void => {
+      clearTimeout(timer);
+      if (killGrace !== null) clearTimeout(killGrace);
+    };
+
+    /**
+     * Read whatever report this run left behind.
+     *
+     * Called on `close`, and again on the timeout path: a killed child may still
+     * have flushed part of its log, and that tail is the only diagnostic the user
+     * gets for a stuck file.
+     */
+    const collect = (code: number): RunResult => {
       let resolvedPath: string | null = null;
       if (existsSync(reportPath)) {
         resolvedPath = reportPath;
@@ -211,7 +257,51 @@ export function runFfmpeg(
         }
       }
 
-      resolve({ code: code ?? -1, report, reportPath: resolvedPath });
+      return { code, report, reportPath: resolvedPath, ...(timedOut ? { timedOut } : {}) };
+    };
+
+    /**
+     * The deadline. A child that has not closed by now is not slow, it is stuck —
+     * so kill it and resolve rather than leaving the batch frozen forever.
+     */
+    const timer = setTimeout(() => {
+      timedOut = true;
+      // Ask first: a normal child exits on SIGTERM.
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+      // Escalate, and resolve regardless — the caller must not wait on a process
+      // that has already refused one signal.
+      killGrace = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+        if (!settled) {
+          settled = true;
+          clearTimers();
+          resolve(collect(-1));
+        }
+      }, KILL_GRACE_MS);
+    }, timeoutMs);
+
+    child.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      reject(new Error(`Failed to start ${bin}: ${err.message}`));
+    });
+
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      // A killed child reports whatever the platform gives; `timedOut` is the flag
+      // callers should branch on, not the numeric code.
+      resolve(collect(code ?? -1));
     });
   });
 }
@@ -225,4 +315,21 @@ export function cleanupReports(cwd: string): void {
   } catch {
     /* best effort */
   }
+}
+
+/**
+ * A human-readable reason for a killed child.
+ *
+ * "ffmpeg exited -1" tells the user nothing, and the files this fires on are
+ * exactly the ones the incident report describes: a damaged FAT32 directory entry
+ * or a stalled device read that never returns. The advice has to be actionable,
+ * because the app cannot fix the device.
+ */
+export function timeoutMessage(target: string, timeoutMs: number): string {
+  const mins = Math.round(timeoutMs / 60_000);
+  return (
+    `${target} 超過 ${mins} 分鐘沒有回應，已中止（檔案本身或隨身碟可能有問題）。` +
+    '建議：用磁碟檢查工具（chkdsk E: /f）修復這支隨身碟，' +
+    '或先把檔案複製到電腦上再轉換。原始檔案沒有被更動。'
+  );
 }

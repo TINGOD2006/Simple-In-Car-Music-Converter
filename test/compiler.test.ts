@@ -232,12 +232,47 @@ test('loudnorm raises the LRA target when the source is wider than the preset', 
   assert(narrow.filterComplex.includes('LRA=11'), 'a narrow source keeps the preset LRA target');
 });
 
-test('the measurement pass emits loudnorm JSON and writes no audio', () => {
+test('the measurement pass emits ebur128 and writes no audio', () => {
   const r = compile(
     baseInput({ measure: { integratedLufs: -14, truePeakDb: -1, lra: 11 }, loudnorm: null }),
   );
-  assert(r.filterComplex.includes('print_format=json'), 'asks loudnorm for JSON');
+  assert(r.filterComplex.includes('ebur128=peak=true'), 'measures with ebur128');
+  assert(!r.filterComplex.includes('print_format=json'), 'no loudnorm JSON pass');
   assert(!r.filterComplex.includes('measured_I'), 'measurement pass has no measured values yet');
+});
+
+test('a silent measurement skips loudnorm instead of emitting -inf', () => {
+  // ebur128 reports digital silence as I=-70 LUFS / Peak=-inf dBFS. Passing that
+  // through produces `measured_TP=-inf`, which ffmpeg rejects with "Result too
+  // large" and a non-zero exit, so the whole export would fail on a silent track.
+  const r = compile(
+    baseInput({
+      loudnorm: {
+        measured: { inputI: -70, inputTp: -Infinity, inputLra: 0, inputThresh: -70, targetOffset: 0 },
+        integratedLufs: -14,
+        truePeakDb: -1.0,
+        lra: 11,
+      },
+    }),
+  );
+  assert(!r.filterComplex.includes('loudnorm'), 'no loudnorm filter for a silent program');
+  assert(!r.filterComplex.includes('inf'), 'no non-finite value reaches ffmpeg');
+});
+
+test('a normal measurement still compiles the linear loudnorm second pass', () => {
+  const r = compile(
+    baseInput({
+      loudnorm: {
+        measured: { inputI: -21.5, inputTp: -3.2, inputLra: 8.1, inputThresh: -31.5, targetOffset: 0 },
+        integratedLufs: -14,
+        truePeakDb: -1.0,
+        lra: 11,
+      },
+    }),
+  );
+  assert(r.filterComplex.includes('measured_I=-21.5'), 'measured integrated level is applied');
+  assert(r.filterComplex.includes('measured_TP=-3.2'), 'measured true peak is applied');
+  assert(r.filterComplex.includes('linear=true'), 'linear mode requested');
 });
 
 test('an empty timeline is rejected', () => {

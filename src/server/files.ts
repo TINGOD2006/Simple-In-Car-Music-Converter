@@ -150,6 +150,79 @@ export function pickPaths(
 }
 
 /* ------------------------------------------------------------------ */
+/* Reveal in the OS file manager                                       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Show `target` in the OS file manager, selecting it when it is a file.
+ *
+ * This exists because a path string is not an answer. When a conversion is
+ * skipped to avoid destroying a lossless source, the user's next question is
+ * always "where is that file?" — and a path they have to retype into Explorer is
+ * a path they will get wrong. Opening the folder with the file already
+ * highlighted answers it in one click.
+ *
+ * Resolves `true` when the file manager was launched, `false` when this platform
+ * has none. Like `pickPaths`, it never throws: a missing desktop is a degraded
+ * feature, not a failed request.
+ *
+ * The exit code is deliberately ignored. `explorer.exe /select,<path>` routinely
+ * exits non-zero even when the window opens, so treating that as failure would
+ * report an error for the normal case.
+ */
+export function revealPath(target: string): Promise<boolean> {
+  if (process.platform !== 'win32') return Promise.resolve(false);
+  if (!existsSync(target)) return Promise.resolve(false);
+
+  let isDir = false;
+  try {
+    isDir = statSync(target).isDirectory();
+  } catch {
+    return Promise.resolve(false);
+  }
+
+  return new Promise((resolvePromise) => {
+    let child;
+    try {
+      // `spawn` with stdio ignored and detached: explorer is a launcher, not a
+      // tool whose output we read. The comma after /select is part of the syntax
+      // and must not be separated by a space.
+      child = spawn('explorer.exe', isDir ? [target] : [`/select,${target}`], {
+        stdio: 'ignore',
+        windowsHide: false,
+        detached: true,
+      });
+    } catch {
+      resolvePromise(false);
+      return;
+    }
+
+    let settled = false;
+    const done = (value: boolean): void => {
+      if (settled) return;
+      settled = true;
+      resolvePromise(value);
+    };
+
+    // explorer hands off to the already-running shell process and exits at once,
+    // so `close` usually arrives within milliseconds. The timer is a guard for the
+    // case where it does not: the window is already up either way, and making the
+    // request wait would freeze the UI behind a dialog the user can see.
+    const timer = setTimeout(() => done(true), 3000);
+    timer.unref?.();
+
+    child.once('error', () => {
+      clearTimeout(timer);
+      done(false);
+    });
+    child.once('close', () => {
+      clearTimeout(timer);
+      done(true);
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Upload                                                              */
 /* ------------------------------------------------------------------ */
 

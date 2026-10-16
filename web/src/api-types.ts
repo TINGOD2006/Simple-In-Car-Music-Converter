@@ -511,3 +511,16 @@ export interface UploadResponse {
   path: string;
   bytes: number;
 }
+
+/**
+ * `POST /api/reveal` 200 body.
+ *
+ * Opens the OS file manager at `path`, selecting it when it is a file. A 501
+ * answers `{ok:false, error}` when no file manager is reachable, and a 404 when
+ * the path no longer exists — the UI says different things for those two, because
+ * only the second one means the user's file moved or was deleted.
+ */
+export interface RevealResponse {
+  ok: true;
+  path: string;
+}

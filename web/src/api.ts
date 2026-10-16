@@ -23,6 +23,7 @@ import type {
   ProbeResponse,
   RenderRequest,
   RenderResponse,
+  RevealResponse,
   ScanResult,
   UploadResponse,
   WaveformResponse,
@@ -230,6 +231,22 @@ export const api = {
   /** `<audio src>` for a file that lives on the engine machine. */
   fileUrl(path: string): string {
     return fileUrl(path);
+  },
+
+  /**
+   * `POST /api/reveal` — show a path in the OS file manager.
+   *
+   * Best-effort by design: the caller has already told the user which file needs
+   * attention, so a rejection here must never replace that message. Returns false
+   * instead of throwing when the path is gone or no file manager exists.
+   */
+  async reveal(path: string, deps: PickDeps = {}): Promise<boolean> {
+    try {
+      await request<RevealResponse>('/api/reveal', postInit({ path }), deps.fetchImpl);
+      return true;
+    } catch {
+      return false;
+    }
   },
 
   /**

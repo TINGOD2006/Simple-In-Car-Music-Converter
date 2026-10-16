@@ -14,6 +14,7 @@ import {
   isStreamableAudio,
   parseByteRange,
   pickPaths,
+  revealPath,
   sanitizeUploadName,
 } from '../src/server/files.ts';
 import { findBinaries, runFfmpeg } from '../src/core/ffbin.ts';
@@ -309,6 +310,51 @@ test('pickPaths answers null rather than throwing when no dialog can open', asyn
   // UI would report a broken feature instead of offering the other path.
   const picked = await pickPaths('files', { shell: 'aus-no-such-shell-3f9c' });
   assertEq(picked, null, 'a shell that cannot start degrades to null');
+});
+
+/* ------------------------------------------------------------------ */
+/* Reveal in the OS file manager                                       */
+/* ------------------------------------------------------------------ */
+
+test('revealPath answers false for a path that does not exist', async () => {
+  // The UI tells the user two different things for "no file manager here" and
+  // "that file is gone", so this distinction has to survive: a missing path must
+  // resolve false WITHOUT launching anything.
+  const missing = join(tmpdir(), 'aus-no-such-file-4c1a', 'nope.mp3');
+  const revealed = await revealPath(missing);
+  assertEq(revealed, false, 'a missing path is not revealed');
+});
+
+test('revealPath never throws on a path outside the filesystem root', async () => {
+  // Whatever the platform does, the contract is a boolean: an exception here
+  // would become a 500 and the UI would lose the message that pointed at the file.
+  const revealed = await revealPath('Z:\\aus-not-a-real-drive-91af\\x.mp3');
+  assertEq(typeof revealed, 'boolean', 'the result is always a boolean');
+});
+
+test('POST /api/reveal requires an absolute existing path', async () => {
+  const root = scratch('reveal');
+  try {
+    await withServer(root, async (base) => {
+      const post = (body: unknown): Promise<Response> =>
+        fetch(`${base}/api/reveal`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+      const noPath = await post({});
+      assertEq(noPath.status, 400, 'a missing path is a client error');
+
+      const relative = await post({ path: 'relative\\song.mp3' });
+      assertEq(relative.status, 400, 'a relative path is refused, not resolved against cwd');
+
+      const absent = await post({ path: join(root, 'gone.mp3') });
+      assertEq(absent.status, 404, 'a path that is not on disk reports 404');
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 /* ------------------------------------------------------------------ */

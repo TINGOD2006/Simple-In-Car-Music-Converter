@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { compile } from './compiler.ts';
 import type { CompileInput, CompileResult } from './compiler.ts';
 import { timelineDuration } from './edl.ts';
-import { cleanupReports, runFfmpeg } from './ffbin.ts';
+import { DEFAULT_RUN_TIMEOUT_MS, cleanupReports, runFfmpeg, timeoutMessage } from './ffbin.ts';
 import type { BinPaths } from './ffbin.ts';
 import { measureLoudness, measurePeak } from './loudness.ts';
 import { probe } from './probe.ts';
@@ -153,9 +153,10 @@ export async function render(opts: RenderOptions): Promise<RenderResult> {
         sizeBytes: 0,
         compile: compiled,
         measured,
-        error:
-          `ffmpeg exited ${run.code}` +
-          (run.report ? `\n${run.report.slice(-1500)}` : ' (no report log)'),
+        error: run.timedOut
+          ? timeoutMessage(`轉換 ${opts.outputPath}`, DEFAULT_RUN_TIMEOUT_MS)
+          : `ffmpeg exited ${run.code}` +
+            (run.report ? `\n${run.report.slice(-1500)}` : ' (no report log)'),
       };
     }
 
@@ -206,6 +207,16 @@ export interface VerifyOptions {
 const DURATION_TOLERANCE_SEC = 0.35;
 const LUFS_TOLERANCE = 1.5;
 const TP_TOLERANCE_DB = 1.0;
+
+/**
+ * Deadline for the verification pass.
+ *
+ * Shorter than the default because verification re-reads a file this process
+ * just wrote: if that read has not finished in two minutes, the file or the
+ * device is broken, and the user is better served by an explained failure than
+ * by a progress bar that never moves.
+ */
+const VERIFY_TIMEOUT_MS = 2 * 60_000;
 
 /**
  * Re-probe an output and assert it matches the preset.
@@ -264,22 +275,35 @@ export async function verify(opts: VerifyOptions): Promise<VerifyResult> {
     }
 
     if (opts.expectLoudness && opts.preset.loudness.enabled) {
-      const tl: Timeline = { clips: [], sampleRate: opts.preset.sampleRate, channels: opts.preset.channels };
+      // `ebur128` rather than loudnorm's analysis mode: the same BS.1770-4
+      // numbers for roughly a fifth of the cost, and this pass runs on every
+      // single file in a batch. See `parseEbur128Report`.
       const args = [
         '-hide_banner',
+        '-nostdin',
         '-i', opts.file,
-        '-af', `loudnorm=I=${opts.preset.loudness.integratedLufs}:TP=${opts.preset.loudness.truePeakDb}:LRA=${opts.preset.loudness.lra}:print_format=json`,
+        '-map', '0:a:0',
+        '-af', 'ebur128=peak=true',
         '-f', 'null', '-',
       ];
-      void tl;
-      const run = await runFfmpeg(opts.bins.ffmpeg, args, { cwd: scratch });
-      if (run.report) {
-        const { parseLoudnormReport } = await import('./loudness.ts');
-        measured = parseLoudnormReport(run.report);
+      const run = await runFfmpeg(opts.bins.ffmpeg, args, {
+        cwd: scratch,
+        timeoutMs: VERIFY_TIMEOUT_MS,
+      });
+      if (run.timedOut) {
+        problems.push(timeoutMessage(`查驗 ${opts.file}`, VERIFY_TIMEOUT_MS));
+      } else if (run.report) {
+        const { parseEbur128Report } = await import('./loudness.ts');
+        measured = parseEbur128Report(run.report);
       }
-      if (!measured) {
+      if (!measured && !run.timedOut) {
         problems.push('could not measure output loudness');
-      } else {
+      } else if (measured && !Number.isFinite(measured.inputI)) {
+        // Digital silence. There is no gain that would reach the target, so this
+        // is a real failure — but "integrated loudness is -Infinity LUFS" reads
+        // like a bug rather than a description of the file.
+        problems.push('output is silent (integrated loudness is below the measurable floor)');
+      } else if (measured) {
         const dl = Math.abs(measured.inputI - opts.preset.loudness.integratedLufs);
         if (dl > LUFS_TOLERANCE) {
           problems.push(

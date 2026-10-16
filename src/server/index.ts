@@ -31,6 +31,7 @@ import { waveform } from './waveform.ts';
 import {
   isStreamableAudio,
   pickPaths,
+  revealPath,
   sendAudioFile,
   streamUpload,
 } from './files.ts';
@@ -385,6 +386,38 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
           return;
         }
         send(res, 200, { ok: true, paths: picked });
+        return;
+      }
+
+      if (path === '/api/reveal' && req.method === 'POST') {
+        const body = (await readBody(req)) as { path?: string };
+        const target = body.path;
+        if (!target) {
+          send(res, 400, { ok: false, error: 'path is required' });
+          return;
+        }
+        // Absolute only. A relative path would be resolved against the engine's
+        // cwd, which is not what the caller means and could select the wrong file.
+        if (!isAbsolute(target)) {
+          send(res, 400, { ok: false, error: 'path must be absolute' });
+          return;
+        }
+        const resolved = resolve(target);
+        // Distinguish "there is no file manager here" from "that file is gone":
+        // the UI phrases them differently, and only the second is the user's fault.
+        if (!existsSync(resolved)) {
+          send(res, 404, { ok: false, error: `file not found: ${resolved}` });
+          return;
+        }
+        const revealed = await revealPath(resolved);
+        if (!revealed) {
+          send(res, 501, {
+            ok: false,
+            error: 'no file manager is available here — open the folder manually',
+          });
+          return;
+        }
+        send(res, 200, { ok: true, path: resolved });
         return;
       }
 

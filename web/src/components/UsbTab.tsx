@@ -211,7 +211,7 @@ function folderLabel(folder: string): string {
   return trimmed || '（工作區根目錄）';
 }
 
-/** The folder a row's file lives in, for the 「複製資料夾路徑」 button. */
+/** The folder a row's file lives in, for the 「開啟檔案位置」 fallback. */
 function parentFolderOf(path: string): string {
   return dirnameOf(path) || path;
 }
@@ -345,7 +345,7 @@ function statusText(row: Row, jobRunning: boolean, targetIsLossy: boolean): stri
 }
 
 /**
- * Whether this row needs the 「複製資料夾路徑」 shortcut: exactly the rows the user
+ * Whether this row needs the 「開啟檔案位置」 shortcut: exactly the rows the user
  * is being warned about (either kind of conversion we refuse to default to) or that
  * already failed — in both cases they want to go look at the file.
  */
@@ -407,15 +407,30 @@ function FolderCheckbox(props: {
   );
 }
 
-type CopyState = 'idle' | 'copied' | 'failed';
+type RevealState = 'idle' | 'opening' | 'opened' | 'copied' | 'failed';
 
 /**
- * 「複製資料夾路徑」 — the answer to "the warning told me a file is about to be
- * degraded, where is it?". A failed copy must not look like a dead button: the
- * path is rendered as selectable text so the user can copy it by hand.
+ * 「開啟檔案位置」 — the answer to "the warning told me a file is about to be
+ * degraded, where is it?".
+ *
+ * Opening the OS file manager with the file already selected is the whole point:
+ * the user is being warned about a SPECIFIC file, and a folder path they have to
+ * retype into Explorer is a path they will get wrong. So the button tries, in
+ * order:
+ *
+ *   1. `POST /api/reveal` — opens the file manager at that file (engine-side, so
+ *      it works even when the page is in a plain browser).
+ *   2. Copy the folder path to the clipboard, for the environments with no file
+ *      manager (a non-Windows engine, or a headless session).
+ *   3. Render the path as selectable text, so a failed copy never leaves the user
+ *      with a dead button and no way to find the file.
+ *
+ * Step 1 failing must NOT be reported as an error: `reveal` resolves false for
+ * "this platform has no file manager", which is a degraded feature rather than a
+ * fault, and the fallback has already answered the user's question.
  */
-function CopyFolderButton({ dir }: { dir: string }): JSX.Element | null {
-  const [state, setState] = useState<CopyState>('idle');
+function RevealFileButton({ path, dir }: { path: string; dir: string }): JSX.Element | null {
+  const [state, setState] = useState<RevealState>('idle');
   const timerRef = useRef<number | null>(null);
 
   useEffect(
@@ -425,9 +440,9 @@ function CopyFolderButton({ dir }: { dir: string }): JSX.Element | null {
     [],
   );
 
-  if (!dir) return null;
+  if (!path && !dir) return null;
 
-  const flash = (next: CopyState): void => {
+  const flash = (next: RevealState): void => {
     setState(next);
     if (timerRef.current !== null) window.clearTimeout(timerRef.current);
     timerRef.current = window.setTimeout(() => {
@@ -436,36 +451,58 @@ function CopyFolderButton({ dir }: { dir: string }): JSX.Element | null {
     }, COPY_FEEDBACK_MS);
   };
 
-  const copy = (): void => {
-    void (async () => {
-      try {
-        // `navigator.clipboard` needs a secure context and is simply absent in
-        // some embeddings — that is a normal failure, not an exception to leak.
-        if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
-          throw new Error('剪貼簿 API 不可用');
-        }
-        await navigator.clipboard.writeText(dir);
-        flash('copied');
-      } catch {
-        flash('failed');
+  /** Clipboard is the fallback route, so its failure is reported separately. */
+  const copyDir = async (): Promise<boolean> => {
+    try {
+      // `navigator.clipboard` needs a secure context and is simply absent in
+      // some embeddings — that is a normal failure, not an exception to leak.
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== 'function') {
+        return false;
       }
+      await navigator.clipboard.writeText(dir || path);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const reveal = (): void => {
+    void (async () => {
+      setState('opening');
+      if (path && (await api.reveal(path))) {
+        flash('opened');
+        return;
+      }
+      flash((await copyDir()) ? 'copied' : 'failed');
     })();
   };
+
+  const label =
+    state === 'opening'
+      ? '開啟中…'
+      : state === 'opened'
+        ? '已開啟'
+        : state === 'copied'
+          ? '已複製路徑'
+          : state === 'failed'
+            ? '找不到位置'
+            : '開啟檔案位置';
 
   return (
     <span className="usb-copy">
       <button
         type="button"
         className="usb-copy-btn"
-        onClick={copy}
-        title={`複製資料夾路徑：${dir}`}
-        aria-label={`複製資料夾路徑 ${dir}`}
+        onClick={reveal}
+        disabled={state === 'opening'}
+        title={`在檔案總管中顯示：${path || dir}`}
+        aria-label={`開啟檔案位置 ${path || dir}`}
       >
-        {state === 'copied' ? '已複製' : state === 'failed' ? '複製失敗' : '複製資料夾路徑'}
+        {label}
       </button>
       {state === 'failed' ? (
-        <span className="mono usb-copy-fallback" title="剪貼簿不可用，請手動選取這段路徑">
-          {dir}
+        <span className="mono usb-copy-fallback" title="請手動選取這段路徑">
+          {path || dir}
         </span>
       ) : null}
     </span>
@@ -1123,7 +1160,7 @@ export default function UsbTab(): JSX.Element {
                 轉成 {targetLabel} 只會讓檔案變大、品質不會變好，要轉請自己勾；
               </>
             ) : null}{' '}
-            列表中的「⚠」列可用「複製資料夾路徑」按鈕直接跳到檔案所在位置。
+            列表中的「⚠」列可用「開啟檔案位置」按鈕直接跳到該檔案所在的資料夾（會自動選取該檔）。
           </p>
         ) : null}
       </div>
@@ -1224,7 +1261,8 @@ export default function UsbTab(): JSX.Element {
                             <span className="hint usb-group-count">
                               {group.rows.length} 個檔案 · 已勾選 {group.checked}
                             </span>
-                            <CopyFolderButton
+                            <RevealFileButton
+                              path={group.rows[0]?.path ?? ''}
                               dir={parentFolderOf(group.rows[0]?.path ?? '')}
                             />
                           </div>
@@ -1267,7 +1305,10 @@ export default function UsbTab(): JSX.Element {
                                   {/* The warning (or the failure) is where the user
                                       needs to reach the actual file on disk. */}
                                   {needsFolderShortcut(row, job.running, targetIsLossy) ? (
-                                    <CopyFolderButton dir={parentFolderOf(row.path)} />
+                                    <RevealFileButton
+                                      path={row.path}
+                                      dir={parentFolderOf(row.path)}
+                                    />
                                   ) : null}
                                 </td>
                               </tr>
