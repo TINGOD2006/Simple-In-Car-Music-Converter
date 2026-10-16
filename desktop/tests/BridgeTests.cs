@@ -82,12 +82,18 @@ internal static class BridgeTests
                 "a numeric id is not a string id");
         });
 
-        Harness.Test("SuccessJson carries the chosen paths", () =>
+        Harness.Test("SuccessJson carries the chosen paths and marks the reply ok", () =>
         {
             var json = BridgeProtocol.SuccessJson("1", new[] { @"C:\music\a.mp3" });
             using var doc = JsonDocument.Parse(json);
 
             Harness.AssertEq(doc.RootElement.GetProperty("id").GetString(), "1", "id echoed back");
+            // The page resolves a pick only when it can see this flag. It was missing here
+            // while the page-side test asserted it, so neither suite could catch the drift:
+            // every finished folder pick looked like a broken bridge, and the page opened the
+            // engine's folder dialog on top of the shell's.
+            Harness.Assert(doc.RootElement.TryGetProperty("ok", out var ok), "ok present");
+            Harness.AssertEq(ok.GetBoolean(), true, "a selection is a success");
             Harness.Assert(doc.RootElement.TryGetProperty("paths", out var paths), "paths present");
             Harness.AssertEq(paths.GetArrayLength(), 1, "one path");
             Harness.AssertEq(paths[0].GetString(), @"C:\music\a.mp3", "path value");
@@ -119,7 +125,38 @@ internal static class BridgeTests
                 "the dialog could not be shown", "error text");
             Harness.Assert(!errorDoc.RootElement.TryGetProperty("cancelled", out _),
                 "an error is not a cancellation");
+            Harness.Assert(!cancelledDoc.RootElement.GetProperty("ok").GetBoolean(),
+                "a cancellation is not a success");
+            Harness.Assert(!errorDoc.RootElement.GetProperty("ok").GetBoolean(),
+                "an error is not a success");
             Harness.Assert(cancelled != error, "the two replies must not be identical");
+        });
+
+        Harness.Test("every reply tells the page whether it succeeded", () =>
+        {
+            // The page classifies a reply by `ok` before anything else, so a reply that is
+            // missing the flag — or carries the wrong one — is read as "the bridge is broken".
+            // That is how a successful folder pick once turned into a second folder window.
+            foreach (var json in new[]
+                     {
+                         BridgeProtocol.SuccessJson("1", new[] { @"C:\a.mp3" }),
+                         BridgeProtocol.CancelledJson("1"),
+                         BridgeProtocol.ErrorJson("1", "boom"),
+                     })
+            {
+                using var doc = JsonDocument.Parse(json);
+                Harness.Assert(doc.RootElement.TryGetProperty("ok", out _), $"ok missing from {json}");
+            }
+
+            Harness.Assert(
+                BridgeProtocol.SuccessJson("abc", Array.Empty<string>()).Contains("\"ok\":true"),
+                "a success writes ok:true, which is what the page looks for");
+            Harness.Assert(
+                !BridgeProtocol.CancelledJson("abc").Contains("\"ok\":true"),
+                "a cancellation must not look like a success");
+            Harness.Assert(
+                !BridgeProtocol.ErrorJson("abc", "boom").Contains("\"ok\":true"),
+                "an error must not look like a success");
         });
 
         Harness.Test("every reply echoes the request id", () =>

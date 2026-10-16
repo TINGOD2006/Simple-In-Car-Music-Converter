@@ -161,7 +161,13 @@ export function bridgePick(
         return;
       }
 
-      if (reply['ok'] === true) {
+      // A success is recognised either way. `ok: true` is the current contract, but a shell
+      // built before that field existed answers with the paths alone — and reading those
+      // replies as failures is precisely what made a finished pick escalate to the engine's
+      // dialog and open a second folder window. `ok` may only *deny* a success, never make
+      // one unreadable.
+      const okFlag = reply['ok'];
+      if (okFlag === true || (okFlag === undefined && Array.isArray(reply['paths']))) {
         const raw = reply['paths'];
         const paths = Array.isArray(raw)
           ? raw.filter((p): p is string => typeof p === 'string')

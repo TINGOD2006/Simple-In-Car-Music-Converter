@@ -77,6 +77,21 @@ test('api-pick: the native bridge wins and the engine is never asked', async () 
   assertEq(spy.calls.length, 0, 'the engine was not asked');
 });
 
+test("api-pick: the shell's own success reply must never reach the engine dialog", async () => {
+  // THE SECOND-DIALOG REGRESSION, at the layer where the user felt it. desktop/Bridge.cs
+  // answered a finished pick with `id`+`paths` and no `ok`; this file required `ok:true`, so
+  // the bridge looked broken, POST /api/pick ran, and the engine's folder dialog opened on
+  // top of the shell's — the second "Browse For Folder" window, and the reason choosing a
+  // folder meant choosing twice. The literal below is the shell's own output.
+  const bridge = bridgeAnswering((m) =>
+    JSON.parse(`{"id":"${String(m.id)}","ok":true,"paths":["C:\\\\music\\\\a.mp3"]}`),
+  );
+  const spy = fetchSpy({});
+  const res = await api.pick({ mode: 'folder' }, { transport: bridge, fetchImpl: spy.fetchImpl });
+  assertEq(res.paths, ['C:\\music\\a.mp3'], 'the shell-selected folder comes back');
+  assertEq(spy.calls.length, 0, 'the engine dialog must not open as well');
+});
+
 test('api-pick: a cancelled bridge is an empty path list, not an error', async () => {
   const bridge = bridgeAnswering((m) => ({ id: m.id, cancelled: true }));
   const spy = fetchSpy({});

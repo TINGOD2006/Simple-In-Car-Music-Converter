@@ -92,6 +92,35 @@ test('native-bridge: an answer with paths resolves to those paths', async () => 
   assertEq(transport.sent[0]!.mode, 'files', 'the request carries the mode');
 });
 
+test('native-bridge: the reply the SHELL actually writes must be accepted', async () => {
+  // The literal JSON strings desktop/Bridge.cs emits, parsed the way WebView2 hands them
+  // to the page. Written out in full because this seam is where the two sides drifted:
+  // the shell answered a finished pick with `id`+`paths` while this file required
+  // `ok:true`, so every success was read as a broken bridge and the caller opened the
+  // engine's folder dialog on top of the shell's — the second "Browse For Folder" window.
+  const wire = (id: unknown, body: string): unknown => JSON.parse(`{"id":"${String(id)}"${body}}`);
+
+  const success = fakeTransport((m) => wire(m.id, ',"ok":true,"paths":["C:\\\\music\\\\a.mp3"]'));
+  assertEq(await bridgePick(success, 'folder'), ['C:\\music\\a.mp3'], 'ok:true plus paths resolves');
+
+  // The shape the shipped shell used to write. It has to keep working: the page ships with
+  // the engine, but a user's installed shell is whatever build they already have.
+  const legacy = fakeTransport((m) => wire(m.id, ',"paths":["C:\\\\music\\\\a.mp3"]'));
+  assertEq(await bridgePick(legacy, 'folder'), ['C:\\music\\a.mp3'], 'paths without ok still resolves');
+
+  const cancel = fakeTransport((m) => wire(m.id, ',"ok":false,"cancelled":true'));
+  assertEq(await bridgePick(cancel, 'folder'), null, 'a cancellation is not an error');
+
+  const failure = fakeTransport((m) =>
+    wire(m.id, ',"ok":false,"error":"no native file dialog is available here"'),
+  );
+  await assertRejects(
+    () => bridgePick(failure, 'folder'),
+    'no native file dialog is available here',
+    'a host that cannot show one still reports its reason',
+  );
+});
+
 test('native-bridge: a cancellation resolves to null, not an error', async () => {
   const transport = fakeTransport((m) => ({ id: m.id, cancelled: true }));
   assertEq(await bridgePick(transport, 'files'), null, 'cancelling is a normal result');

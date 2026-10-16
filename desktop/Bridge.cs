@@ -67,10 +67,18 @@ public static class BridgeProtocol
         }
     }
 
-    /// <summary>Reports the chosen paths. An empty list means the dialog returned nothing.</summary>
+    /// <summary>
+    /// Reports the chosen paths. An empty list means the dialog returned nothing.
+    ///
+    /// <c>ok</c> is not decoration. The page resolves a pick only when it can see that the host
+    /// succeeded; a success reply without this flag was classified as a failure, so the page
+    /// escalated to the engine's own folder dialog and the user was left with a second window
+    /// stacked on the one they had just answered — "I have to choose the folder twice".
+    /// </summary>
     public static string SuccessJson(string id, IReadOnlyList<string> paths) => Write(writer =>
     {
         writer.WriteString("id", id);
+        writer.WriteBoolean("ok", true);
         writer.WriteStartArray("paths");
         foreach (var path in paths) writer.WriteStringValue(path);
         writer.WriteEndArray();
@@ -80,6 +88,9 @@ public static class BridgeProtocol
     public static string CancelledJson(string id) => Write(writer =>
     {
         writer.WriteString("id", id);
+        // Stated rather than implied by the absence of `ok`: a reply the page cannot classify
+        // becomes an error banner, and cancelling a dialog is not an error.
+        writer.WriteBoolean("ok", false);
         writer.WriteBoolean("cancelled", true);
     });
 
@@ -87,6 +98,7 @@ public static class BridgeProtocol
     public static string ErrorJson(string id, string message) => Write(writer =>
     {
         writer.WriteString("id", id);
+        writer.WriteBoolean("ok", false);
         writer.WriteString("error", message);
     });
 
