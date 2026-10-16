@@ -45,7 +45,7 @@ import type {
   MediaInfo,
   ScanError,
 } from '../api-types.ts';
-import { PRESETS, presetById } from '../presets.ts';
+import { DEFAULT_PRESET_ID, PRESETS, choiceById, presetById } from '../presets.ts';
 import type { PresetChoice } from '../presets.ts';
 import { collectDroppedFiles, dropHasFiles, extensionOf } from '../file-intake.ts';
 import { useApp } from '../app-context.ts';
@@ -73,13 +73,19 @@ const COPY_FEEDBACK_MS = 2400;
 type TargetId = PresetChoice['id'];
 
 /**
- * Which target formats are LOSSY. Only a lossy target can lose a lossless source's
- * data, so the 「無損→有損」 warning (and the default of NOT ticking such a row)
- * applies to MP3 alone. FLAC and WAV are lossless: re-encoding a FLAC into them is
- * not a destructive one-way door, so nothing is warned about and the rows default
- * to checked. Keyed by id so a new preset cannot silently inherit "lossy".
+ * Which target formats are LOSSY, read straight off each preset. Only a lossy target
+ * can lose a lossless source's data, so the 「無損→有損」 warning (and the default of
+ * NOT ticking such a row) applies to lossy targets alone. FLAC and WAV are lossless:
+ * re-encoding a FLAC into them is not a destructive one-way door, so those rows
+ * default to checked.
+ *
+ * Derived rather than hand-listed: a new preset cannot silently inherit the wrong
+ * kind, and `test/presets.test.ts` pins `PresetChoice.lossy` against the engine's
+ * own `isLossy()` so the two definitions cannot drift apart.
  */
-const TARGET_IS_LOSSY: Record<TargetId, boolean> = { usb: true, flac: false, wav: false };
+const TARGET_IS_LOSSY: Record<TargetId, boolean> = Object.fromEntries(
+  PRESETS.map((p) => [p.id, p.lossy]),
+) as Record<TargetId, boolean>;
 
 /** 「MP3 320 kbps / 44.1 kHz」-style summary of what the chosen preset really is. */
 function targetSpecText(id: TargetId): string {
@@ -130,10 +136,19 @@ interface Row {
   /** Containing folder, expressed relative to the workspace root (`/Album1`). */
   folder: string;
   lossless: boolean;
-  /** mp3 AND 44.1 kHz — halves of the "already conforms" rule known up front. */
-  mp3AtTargetRate: boolean;
+  /**
+   * The source's sample rate, kept so the target-dependent rules can be re-evaluated
+   * when the user switches format — the displayed `format` string is not enough.
+   */
+  sampleRate: number | null;
+  /**
+   * Already in the TARGET's container at the TARGET's sample rate — the half of the
+   * "already conforms" rule that the scan alone can answer. It is target-dependent,
+   * so changing the target re-evaluates it.
+   */
+  atTargetFormat: boolean;
   loudness: Loudness;
-  /** mp3 @ 44.1 kHz AND within tolerance of the target. Needs a measurement. */
+  /** In the target format AND within tolerance of the target. Needs a measurement. */
   conforms: boolean;
   checked: boolean;
   /** The user (or 全選 / 全不選) set this checkbox; defaults must not override it. */
@@ -292,7 +307,28 @@ function defaultChecked(row: Row, targetIsLossy: boolean): boolean {
   return verdict === 'raise-quality' || verdict === 'repack';
 }
 
-function rowFromEntry(entry: LibraryEntry, root: string, targetIsLossy: boolean): Row {
+/** Is this file already in the target's container at the target's sample rate? */
+function atTargetFormatOf(row: Row, target: PresetChoice): boolean {
+  return extensionOf(row.path) === target.extension && row.sampleRate === target.make().sampleRate;
+}
+
+/**
+ * Re-derive everything about a row that depends on WHICH target is selected.
+ *
+ * An MP3 at 44.1 kHz already conforms for the MP3 target and does not for FLAC, so
+ * both `atTargetFormat` and `conforms` have to be recomputed whenever the target
+ * changes — not just the default tick.
+ */
+function retarget(row: Row, target: PresetChoice): Row {
+  const atTargetFormat = atTargetFormatOf(row, target);
+  const conforms =
+    atTargetFormat &&
+    row.loudness.kind === 'ok' &&
+    Math.abs(row.loudness.lufs - TARGET_LUFS) <= CONFORM_TOLERANCE_LUFS;
+  return { ...row, atTargetFormat, conforms };
+}
+
+function rowFromEntry(entry: LibraryEntry, root: string, target: PresetChoice): Row {
   const ext = extensionOf(entry.path);
   const lossless = LOSSLESS.has(ext);
   const info = entry.info;
@@ -303,7 +339,8 @@ function rowFromEntry(entry: LibraryEntry, root: string, targetIsLossy: boolean)
     durationSec: info.format.durationSec,
     folder: relativeFolder(entry.path, root),
     lossless,
-    mp3AtTargetRate: ext === 'mp3' && info.audio?.sampleRate === 44100,
+    sampleRate: info.audio?.sampleRate ?? null,
+    atTargetFormat: false,
     loudness: { kind: 'pending' },
     conforms: false,
     // Placeholder only — overwritten by `defaultChecked` on the very next line.
@@ -312,17 +349,14 @@ function rowFromEntry(entry: LibraryEntry, root: string, targetIsLossy: boolean)
     touched: false,
     outcome: null,
   };
-  return { ...base, checked: defaultChecked(base, targetIsLossy) };
+  const next = retarget(base, target);
+  return { ...next, checked: defaultChecked(next, target.lossy) };
 }
 
 /** Apply a measurement, then re-evaluate the default unless the user has spoken. */
-function withMeasurement(row: Row, loudness: Loudness, targetIsLossy: boolean): Row {
-  const conforms =
-    loudness.kind === 'ok' &&
-    row.mp3AtTargetRate &&
-    Math.abs(loudness.lufs - TARGET_LUFS) <= CONFORM_TOLERANCE_LUFS;
-  const next: Row = { ...row, loudness, conforms };
-  return { ...next, checked: row.touched ? row.checked : defaultChecked(next, targetIsLossy) };
+function withMeasurement(row: Row, loudness: Loudness, target: PresetChoice): Row {
+  const next = retarget({ ...row, loudness }, target);
+  return { ...next, checked: row.touched ? row.checked : defaultChecked(next, target.lossy) };
 }
 
 function statusText(row: Row, jobRunning: boolean, targetIsLossy: boolean): string {
@@ -536,13 +570,14 @@ export default function UsbTab(): JSX.Element {
   const rootRef = useRef('');
   rootRef.current = root;
   /**
-   * Whether the CURRENT target is lossy, readable from an async continuation.
-   * Measurements land long after the click that changed the target, so the default
-   * tick rule they re-apply (`withMeasurement`) must see the target in force NOW,
-   * not the one captured when the measurement started.
+   * The CURRENT target, readable from an async continuation. Measurements land long
+   * after the click that changed the target, so the rules they re-apply
+   * (`withMeasurement`'s default tick, and whether the file is already in the target
+   * format at all) must see the target in force NOW, not the one captured when the
+   * measurement started.
    */
-  const targetIsLossyRef = useRef(TARGET_IS_LOSSY.usb);
-  targetIsLossyRef.current = TARGET_IS_LOSSY[target];
+  const targetChoiceRef = useRef(choiceById(DEFAULT_PRESET_ID));
+  targetChoiceRef.current = choiceById(target);
 
   /** Bumped by every scan: a measurement in flight for an older listing is dropped. */
   const generationRef = useRef(0);
@@ -584,7 +619,7 @@ export default function UsbTab(): JSX.Element {
         const res = await api.library(dir);
         const entries = res.entries ?? [];
         const errors = res.errors ?? [];
-        const next = entries.map((e) => rowFromEntry(e, dir, targetIsLossyRef.current));
+        const next = entries.map((e) => rowFromEntry(e, dir, targetChoiceRef.current));
         setRows(next);
         setScanErrors(errors);
         dispatch({
@@ -634,7 +669,7 @@ export default function UsbTab(): JSX.Element {
 
         if (generationRef.current !== generation) return;
         setRows((prev) =>
-          prev.map((r) => (r.path === path ? withMeasurement(r, loudness, targetIsLossyRef.current) : r)),
+          prev.map((r) => (r.path === path ? withMeasurement(r, loudness, targetChoiceRef.current) : r)),
         );
       }
     };
@@ -737,6 +772,19 @@ export default function UsbTab(): JSX.Element {
   }, []);
 
   /**
+   * 全選未達標: tick every row that is not already 已達標, and untick the ones that
+   * are. This is the toolbar's selective counterpart to the header's 全選 — the point
+   * of it is that pressing it leaves the files needing nothing alone.
+   *
+   * It deliberately INCLUDES the two ⚠ verdicts (`無損→有損`, `有損→無損無益`) that the
+   * default tick refuses to make for the user. Pressing the button is that user
+   * saying "yes, those too", which is exactly why it is a button and not a default.
+   */
+  const setAllUnmetChecked = useCallback(() => {
+    setRows((prev) => prev.map((r) => ({ ...r, checked: !r.conforms, touched: true })));
+  }, []);
+
+  /**
    * One folder's header tick-box. A single `map` over the flat list — the rows are
    * keyed by their own `folder`, so this is O(n) and never compares groups to rows.
    */
@@ -762,11 +810,16 @@ export default function UsbTab(): JSX.Element {
    * ticked or unticked by hand keep that decision (`touched`).
    */
   const chooseTarget = useCallback((id: TargetId) => {
+    const choice = choiceById(id);
     // Readable before React re-renders: a measurement may land in between.
-    targetIsLossyRef.current = TARGET_IS_LOSSY[id];
+    targetChoiceRef.current = choice;
     setTarget(id);
     setRows((prev) =>
-      prev.map((r) => (r.touched ? r : { ...r, checked: defaultChecked(r, TARGET_IS_LOSSY[id]) })),
+      prev.map((r) => {
+        // `atTargetFormat` and `conforms` move with the target, not just the tick.
+        const next = retarget(r, choice);
+        return r.touched ? next : { ...next, checked: defaultChecked(next, choice.lossy) };
+      }),
     );
   }, []);
 
@@ -974,6 +1027,22 @@ export default function UsbTab(): JSX.Element {
 
   const checkedCount = useMemo(() => rows.filter((r) => r.checked).length, [rows]);
   /**
+   * 未達標 = everything that is not already 已達標 (`conforms`). That DELIBERATELY
+   * includes the two ⚠ verdicts the default tick leaves alone, because pressing
+   * 「全選未達標」 is the user saying they do want those converted.
+   */
+  const unmetCount = useMemo(() => rows.filter((r) => !r.conforms).length, [rows]);
+  const allChecked = rows.length > 0 && checkedCount === rows.length;
+  /**
+   * The header tick-box has three states, and `indeterminate` is a DOM property with
+   * no HTML attribute — React cannot set it declaratively, so an effect pushes it.
+   */
+  const headerCheckRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    const el = headerCheckRef.current;
+    if (el) el.indeterminate = checkedCount > 0 && checkedCount < rows.length;
+  }, [checkedCount, rows.length]);
+  /**
    * Rows that are left out of the batch on purpose, split by the reason the status
    * column shows. Both must be reported: against a lossless target a library of
    * lossy files is excluded by the 「有損→無損無益」 rule, and a summary that only
@@ -1108,13 +1177,24 @@ export default function UsbTab(): JSX.Element {
         </div>
         <p className="hint">
           {targetIsLossy
-            ? '目前是 MP3（有損）：無損來源預設不勾（勾了等於永久降級，未勾選的無損檔一律保持原狀）；有損來源只有已達標的不勾。'
+            ? `目前是 ${targetLabel}（有損）：無損來源預設不勾（勾了等於永久降級，未勾選的無損檔一律保持原狀）；有損來源只有已達標的不勾。`
             : '目前是無損目標：無損來源重新編碼不會損失資料，預設會勾選；有損來源預設不勾 —— 把 MP3 之類的有損檔轉成無損只會讓檔案變大 2–4 倍，品質不會變好，要轉請自己勾。'}
         </p>
 
         <div className="usb-head usb-actions">
-          <button onClick={() => setAllChecked(true)} disabled={rows.length === 0 || job.running}>
-            全選
+          {/*
+            全選 lives in the table header, at the top-left of the list. The toolbar's
+            button is the SELECTIVE one: everything that still needs work, which is what
+            a user actually wants after a scan — and it leaves already-conforming files
+            alone instead of re-encoding them for nothing.
+          */}
+          <button
+            onClick={setAllUnmetChecked}
+            disabled={rows.length === 0 || job.running || unmetCount === 0}
+            title="勾選所有尚未達標的檔案（包含 ⚠ 的列），並取消勾選已達標的列"
+          >
+            全選未達標
+            {unmetCount > 0 ? `（${unmetCount}）` : ''}
           </button>
           <button onClick={() => setAllChecked(false)} disabled={rows.length === 0 || job.running}>
             全不選
@@ -1222,7 +1302,22 @@ export default function UsbTab(): JSX.Element {
             <table className="usb-table">
               <thead>
                 <tr>
-                  <th className="usb-check" aria-label="選取" />
+                  {/*
+                    The list's own 全選, at the top-left of the table. Three states:
+                    all / none / some, the last pushed in via `indeterminate` because
+                    React has no attribute for it.
+                  */}
+                  <th className="usb-check">
+                    <input
+                      ref={headerCheckRef}
+                      type="checkbox"
+                      checked={allChecked}
+                      disabled={rows.length === 0 || job.running}
+                      aria-label="全選"
+                      title="全選／全不選"
+                      onChange={(e) => setAllChecked(e.target.checked)}
+                    />
+                  </th>
                   <th>檔名</th>
                   <th>格式</th>
                   <th>時長</th>

@@ -310,7 +310,12 @@ function timelineDurationSafe(t: Timeline): number {
   return d > 0 ? Number(d.toFixed(6)) : 1;
 }
 
-function isLossy(codec: string): boolean {
+/**
+ * Whether a codec throws audio away. Exported because the UI's preset list has to
+ * agree with the engine about which targets are lossy, and `test/presets.test.ts`
+ * pins the two together.
+ */
+export function isLossy(codec: string): boolean {
   return ['libmp3lame', 'libvorbis', 'libopus', 'aac', 'wmav2', 'libtwolame'].includes(codec);
 }
 

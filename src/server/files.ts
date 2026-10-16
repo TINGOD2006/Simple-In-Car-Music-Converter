@@ -86,43 +86,46 @@ export function isStreamableAudio(filePath: string): boolean {
  *
  * Piped stdio is required to read the chosen paths back. Where a sandbox forbids
  * that, `spawn` throws and we answer `null` — the documented degradation.
+ *
+ * Two details here exist because of real-machine reports, not theory:
+ *
+ *  - The dialog is given a one-pixel topmost owner form. A dialog with no owner is
+ *    a dialog Windows will not hand the foreground to, and an inactive dialog
+ *    spends the user's first click on being activated — the reported "I have to
+ *    choose the folder twice".
+ *  - The shell is probed down a short list. `powershell.exe` ships with every
+ *    supported Windows, but a locked-down or ARM image may only carry `pwsh`, and a
+ *    missing dialog is a dead end while a fallback is one spawn away.
  */
-export function pickPaths(
-  mode: 'files' | 'folder',
-  opts: { title?: string; multiple?: boolean; shell?: string } = {},
-): Promise<string[] | null> {
-  if (process.platform !== 'win32') return Promise.resolve(null);
+const POWERSHELL_CANDIDATES = ['powershell.exe', 'pwsh.exe', 'pwsh'];
 
-  const title = (opts.title ?? (mode === 'folder' ? 'Select a folder' : 'Select audio files'))
-    .replace(/'/g, "''");
-  const script =
-    mode === 'folder'
-      ? [
-          'Add-Type -AssemblyName System.Windows.Forms | Out-Null',
-          '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
-          `$d.Description = '${title}'`,
-          '$d.ShowNewFolderButton = $false',
-          'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }',
-        ].join('; ')
-      : [
-          'Add-Type -AssemblyName System.Windows.Forms | Out-Null',
-          '$d = New-Object System.Windows.Forms.OpenFileDialog',
-          `$d.Title = '${title}'`,
-          `$d.Multiselect = $${opts.multiple === false ? 'false' : 'true'}`,
-          "$d.Filter = 'Audio files|*.mp3;*.wav;*.flac;*.ogg;*.oga;*.opus;*.m4a;*.aac;*.wma;*.aiff;*.aif;*.ape;*.wv;*.tta;*.mka;*.mp4;*.w64;*.caf|All files|*.*'",
-          'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames | ForEach-Object { Write-Output $_ } }',
-        ].join('; ');
+/**
+ * The outcome of one dialog attempt.
+ *
+ * `started: false` means the shell itself is not there, which is the only reason to
+ * try the next candidate — a shell that RAN and failed gets no second attempt,
+ * because the dialog may already have been on screen and a retry would pop it twice.
+ */
+type DialogRun = { started: boolean; paths: string[] | null };
 
+/** Run one dialog script through one shell. */
+function runDialog(shell: string, script: string): Promise<DialogRun> {
   return new Promise((resolvePromise) => {
+    let settled = false;
+    const settle = (run: DialogRun): void => {
+      if (settled) return;
+      settled = true;
+      resolvePromise(run);
+    };
+
     let child;
     try {
-      child = spawn(
-        opts.shell ?? 'powershell.exe',
-        ['-NoProfile', '-STA', '-NonInteractive', '-Command', script],
-        { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true },
-      );
+      child = spawn(shell, ['-NoProfile', '-STA', '-NonInteractive', '-Command', script], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
     } catch {
-      resolvePromise(null);
+      settle({ started: false, paths: null });
       return;
     }
 
@@ -133,20 +136,87 @@ export function pickPaths(
     // Drain stderr so a chatty profile cannot fill the pipe and stall the dialog.
     child.stderr?.on('data', () => {});
 
-    child.once('error', () => resolvePromise(null));
+    child.once('error', () => settle({ started: false, paths: null }));
     child.once('close', (code) => {
-      if (code !== 0) {
-        resolvePromise(null);
-        return;
-      }
-      resolvePromise(
-        out
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter(Boolean),
-      );
+      settle({
+        started: true,
+        paths:
+          code !== 0
+            ? null
+            : out
+                .split(/\r?\n/)
+                .map((line) => line.trim())
+                .filter(Boolean),
+      });
     });
   });
+}
+
+export async function pickPaths(
+  mode: 'files' | 'folder',
+  opts: { title?: string; multiple?: boolean; shell?: string } = {},
+): Promise<string[] | null> {
+  if (process.platform !== 'win32') return Promise.resolve(null);
+
+  const title = (opts.title ?? (mode === 'folder' ? 'Select a folder' : 'Select audio files'))
+    .replace(/'/g, "''");
+  // `$o` is the owner window: shown, activated, topmost, and one pixel wide. See the
+  // doc comment above — this is what stops the first click from being swallowed.
+  const script =
+    mode === 'folder'
+      ? [
+          'Add-Type -AssemblyName System.Windows.Forms | Out-Null',
+          'Add-Type -AssemblyName System.Drawing | Out-Null',
+          '$o = New-Object System.Windows.Forms.Form',
+          '$o.ShowInTaskbar = $false',
+          '$o.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None',
+          '$o.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen',
+          '$o.Size = New-Object System.Drawing.Size(1,1)',
+          '$o.TopMost = $true',
+          '$o.Show()',
+          '$o.Activate()',
+          '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+          `$d.Description = '${title}'`,
+          '$d.ShowNewFolderButton = $false',
+          '$r = $d.ShowDialog($o)',
+          '$o.Close()',
+          'if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }',
+        ].join('; ')
+      : [
+          'Add-Type -AssemblyName System.Windows.Forms | Out-Null',
+          'Add-Type -AssemblyName System.Drawing | Out-Null',
+          '$o = New-Object System.Windows.Forms.Form',
+          '$o.ShowInTaskbar = $false',
+          '$o.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None',
+          '$o.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen',
+          '$o.Size = New-Object System.Drawing.Size(1,1)',
+          '$o.TopMost = $true',
+          '$o.Show()',
+          '$o.Activate()',
+          '$d = New-Object System.Windows.Forms.OpenFileDialog',
+          `$d.Title = '${title}'`,
+          `$d.Multiselect = $${opts.multiple === false ? 'false' : 'true'}`,
+          "$d.Filter = 'Audio files|*.mp3;*.wav;*.flac;*.ogg;*.oga;*.opus;*.m4a;*.aac;*.wma;*.aiff;*.aif;*.ape;*.wv;*.tta;*.mka;*.mp4;*.w64;*.caf|All files|*.*'",
+          '$r = $d.ShowDialog($o)',
+          '$o.Close()',
+          'if ($r -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames | ForEach-Object { Write-Output $_ } }',
+        ].join('; ');
+
+  const shells = opts.shell ? [opts.shell] : POWERSHELL_CANDIDATES;
+  for (const shell of shells) {
+    const run = await runDialog(shell, script);
+    // This shell is not installed; the next candidate is one spawn away.
+    if (!run.started) continue;
+    // It ran and failed. That may mean the dialog was already on screen and the
+    // user is looking at it, so retrying would be worse than giving up.
+    if (run.paths === null) return null;
+    // The dialog deliberately offers an "All files" entry, so a user can pick
+    // something the engine will then refuse with a bare 415. Dropping those here
+    // means the list the page receives is one it can actually convert.
+    return mode === 'files' ? run.paths.filter(isStreamableAudio) : run.paths;
+  }
+
+  return null;
 }
 
 /* ------------------------------------------------------------------ */

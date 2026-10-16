@@ -270,6 +270,33 @@ public sealed class MainForm : Form
             return;
         }
 
+        // THE DIALOG MUST NOT OPEN FROM INSIDE THIS HANDLER.
+        //
+        // A modal dialog shown here is created while the WebView2 is still dispatching this very
+        // message, so it comes up behind an active child window and without the foreground.
+        // Windows then spends the user's first click on the dialog simply activating it, which is
+        // the reported "I have to choose the folder twice". Posting the work to the message queue
+        // lets this handler return first, so the dialog is the only thing waiting for input.
+        BeginInvoke(new Action(() => ShowPickDialog(request)));
+    }
+
+    /// <summary>
+    /// Shows the native dialog away from the WebView2 message handler, then answers the page.
+    /// </summary>
+    private void ShowPickDialog(PickRequest request)
+    {
+        // Bring the shell to the foreground first. A dialog owned by a background window is
+        // precisely the inactive dialog that eats its first click.
+        try
+        {
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            Activate();
+        }
+        catch
+        {
+            // Not fatal: the dialog still opens, it may just need one click to take focus.
+        }
+
         string[]? paths;
         if (request.Mode == "folder")
         {
