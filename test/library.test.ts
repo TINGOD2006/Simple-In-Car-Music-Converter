@@ -18,6 +18,8 @@ import { assert, assertEq, test } from './harness.ts';
 import { findBinaries, runFfmpeg } from '../src/core/ffbin.ts';
 import type { BinPaths } from '../src/core/ffbin.ts';
 import { AUDIO_EXTENSIONS, isAudioFile, scanLibrary } from '../src/core/library.ts';
+import { probe } from '../src/core/probe.ts';
+import type { MediaInfo } from '../src/core/types.ts';
 
 let bins: BinPaths | null = null;
 let unavailable = '';
@@ -247,6 +249,233 @@ test('INTEGRATION: scanLibrary probes a real file and leaves no scratch residue'
       : [];
     assertEq(leftover.length, 0, `no probe JSON left behind, found ${JSON.stringify(leftover)}`);
     assertEq(statSync(wav).size, before, 'the source file was not modified by probing');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: probe() refuses a file it cannot open instead of blaming its streams', async () => {
+  if (skipUnlessAvailable()) return;
+  const dir = scratch('unopenable');
+  try {
+    const gone = join(dir, 'not-here.mp3');
+    let message = '';
+    let returned: unknown = null;
+    try {
+      returned = await probe(bins!.ffprobe, gone, dir);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    assert(returned === null, `probe() must throw, not return ${JSON.stringify(returned)}`);
+    assert(message.includes('not-here.mp3'), `the message names the file: ${message}`);
+    assert(
+      !message.includes('no audio stream'),
+      `the message must not blame the streams for an unopenable file: ${message}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: probe() treats an unparseable file as an error, not as an empty stream list', async () => {
+  if (skipUnlessAvailable()) return;
+  const dir = scratch('garbage');
+  try {
+    const junk = join(dir, 'pretend.mp3');
+    writeFileSync(junk, 'this is a text file wearing an .mp3 extension, and ffprobe will not be fooled');
+    let message = '';
+    let returned: unknown = null;
+    try {
+      returned = await probe(bins!.ffprobe, junk, dir);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    assert(returned === null, `probe() must throw, not return ${JSON.stringify(returned)}`);
+    assert(
+      /could not be read|no stream|unparseable|empty result/i.test(message),
+      `the message explains that ffprobe could not read the file: ${message}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: a file with a video stream but no audio still reports "no audio stream"', async () => {
+  if (skipUnlessAvailable()) return;
+  const dir = scratch('video-only');
+  try {
+    const movie = join(dir, 'clip.mp4');
+    const r = await runFfmpeg(
+      bins!.ffmpeg,
+      [
+        '-hide_banner', '-loglevel', 'error', '-y',
+        '-f', 'lavfi', '-i', 'testsrc=duration=1:size=64x64:rate=5',
+        '-c:v', 'mpeg4', '-an', movie,
+      ],
+      { cwd: dir },
+    );
+    if (r.code !== 0 || !existsSync(movie)) {
+      process.stdout.write(`  (skipping: could not encode a video-only file, exit ${r.code})\n`);
+      return;
+    }
+    const info = await probe(bins!.ffprobe, movie, dir);
+    assertEq(info.audio, null, 'a video-only file has no audio stream, and that is a real answer');
+    assert(info.streams.length === 0, 'and no audio streams were invented');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('library: scanning probes files concurrently and still reports them sorted', async () => {
+  const dir = scratch('concurrent');
+  try {
+    const music = join(dir, 'music');
+    mkdirSync(music, { recursive: true });
+    for (let i = 0; i < 12; i += 1) {
+      writeFileSync(join(music, `t${String(i).padStart(2, '0')}.mp3`), 'not really audio');
+    }
+
+    let inFlight = 0;
+    let peak = 0;
+    let probed = 0;
+    const fake = async (ffprobe: string, file: string): Promise<MediaInfo> => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 15));
+      inFlight -= 1;
+      probed += 1;
+      assertEq(ffprobe, 'injected', 'the injected probe receives the configured ffprobe path');
+      return {
+        path: file,
+        streams: [
+          {
+            index: 0,
+            codecName: 'mp3',
+            codecLongName: 'MP3',
+            sampleRate: 44100,
+            channels: 2,
+            channelLayout: 'stereo',
+            bitsPerRawSample: null,
+            bitRate: 320000,
+            durationSec: 1,
+          },
+        ],
+        audio: {
+          index: 0,
+          codecName: 'mp3',
+          codecLongName: 'MP3',
+          sampleRate: 44100,
+          channels: 2,
+          channelLayout: 'stereo',
+          bitsPerRawSample: null,
+          bitRate: 320000,
+          durationSec: 1,
+        },
+        format: {
+          formatName: 'mp3',
+          formatLongName: 'MP3',
+          durationSec: 1,
+          sizeBytes: 16,
+          bitRate: 320000,
+          tags: {},
+        },
+        probedAt: '2026-01-01T00:00:00.000Z',
+      };
+    };
+
+    const result = await scanLibrary({
+      roots: [music],
+      ffprobe: 'injected',
+      scratch: dir,
+      probeFile: fake,
+      concurrency: 4,
+    });
+
+    assertEq(result.entries.length, 12, 'every file was probed');
+    assertEq(probed, 12, 'and exactly once each');
+    assertEq(result.errors.length, 0, 'nothing failed');
+    assert(peak > 1, `probing actually ran concurrently (peak ${peak})`);
+    assert(peak <= 4, `and stayed inside the injected limit (peak ${peak})`);
+
+    const paths = result.entries.map((e) => e.path);
+    assertEq(paths, [...paths].sort(), 'entries stay sorted no matter what order the probes finished in');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('library: a leftover staging file beside its own track is never scanned', async () => {
+  // The 2026-10-16 incident: an interrupted overwrite left
+  // `Song - Artist.aus-tmp-u9nvkk.mp3` next to `Song - Artist.mp3`. `extname()` sees
+  // `.mp3`, so the scan would have reported the half-written staging file as a
+  // second, real track; the batch then "preserved" the original by renaming the
+  // staging file onto the name it already occupied, and the user got `Song - Artist
+  // (2).mp3`. A scanner that never lists it cannot get there.
+  const dir = scratch('staging-leftover');
+  try {
+    const music = join(dir, 'music');
+    const album = join(music, 'album');
+    mkdirSync(album, { recursive: true });
+
+    const track = join(music, 'Song - Artist.mp3');
+    const leftover = join(music, 'Song - Artist.aus-tmp-u9nvkk.mp3');
+    const deepTrack = join(album, 'Deep - Artist.mp3');
+    const deepLeftover = join(album, 'Deep - Artist.AUS-TMP-AAA111.mp3');
+    writeFileSync(track, 'not really audio');
+    writeFileSync(leftover, 'half-written staging bytes');
+    writeFileSync(deepTrack, 'not really audio');
+    writeFileSync(deepLeftover, 'half-written staging bytes');
+
+    const oneStream = (file: string): MediaInfo => {
+      const audio = {
+        index: 0,
+        codecName: 'mp3',
+        codecLongName: 'MP3',
+        sampleRate: 44100,
+        channels: 2,
+        channelLayout: 'stereo',
+        bitsPerRawSample: null,
+        bitRate: 320000,
+        durationSec: 1,
+      };
+      return {
+        path: file,
+        streams: [audio],
+        audio,
+        format: {
+          formatName: 'mp3',
+          formatLongName: 'MP3',
+          durationSec: 1,
+          sizeBytes: 16,
+          bitRate: 320000,
+          tags: {},
+        },
+        probedAt: '2026-01-01T00:00:00.000Z',
+      };
+    };
+
+    const probed: string[] = [];
+    const fake = async (_ffprobe: string, file: string): Promise<MediaInfo> => {
+      probed.push(file);
+      return oneStream(file);
+    };
+
+    const result = await scanLibrary({
+      roots: [music],
+      ffprobe: 'injected',
+      scratch: dir,
+      probeFile: fake,
+      concurrency: 2,
+    });
+
+    const expected = [track, deepTrack].sort();
+    assertEq(result.entries.map((e) => e.path), expected, 'only the two real tracks are entries');
+    assertEq(probed.slice().sort(), expected, 'ffprobe was only ever asked about the real tracks');
+    assertEq(result.errors.length, 0, 'and the staging files are not reported as errors either');
+    assert(
+      !result.entries.some((e) => e.path.includes('.aus-tmp-')),
+      'no entry points at a staging file',
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

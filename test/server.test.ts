@@ -10,7 +10,7 @@ import { assert, assertEq, test } from './harness.ts';
 import { startServer } from '../src/server/index.ts';
 import { startJob, getJob, listJobs } from '../src/server/jobs.ts';
 import { findBinaries, runFfmpeg } from '../src/core/ffbin.ts';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { connect } from 'node:net';
@@ -632,6 +632,110 @@ test('end-to-end: /api/batch plans and then runs a real USB batch', async () => 
   }
 });
 
+test("end-to-end: a real batch sweeps a previous crash's staging file, a dry run does not", async () => {
+  // A run killed between "rendered" and "renamed" leaves `<name>.aus-tmp-xxxxxx.mp3`
+  // beside the real track. The scanner ignores that name (core/library.ts), but the
+  // file still holds its bytes on the stick until some later *real* run reclaims it.
+  // A dry run must not: it promises to plan without touching the disk.
+  if (!e2eBins) {
+    process.stdout.write('  (skipping: ffmpeg not found)\n');
+    return;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'aus-server-sweep-'));
+  const outDir = join(dir, 'usb');
+  mkdirSync(outDir, { recursive: true });
+
+  try {
+    const track = await makeTone(dir, 'song.mp3', 440, 1);
+    const leftover = join(dir, 'song.aus-tmp-abc123.mp3');
+    copyFileSync(track, leftover);
+    // Older than staging.ts's staleness window (one hour), or the sweep keeps it.
+    const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(leftover, stale, stale);
+
+    await withServer(async ({ base }) => {
+      const preset = {
+        container: 'mp3', codec: 'libmp3lame', bitrateKbps: 320, sampleRate: 44100,
+        channels: 2, id3v2Version: 3, denoise: 'gentle',
+        loudness: { enabled: true, integratedLufs: -14, truePeakDb: -1, lra: 11 },
+      };
+
+      // --- 1. dry run: plans the real track, deletes nothing -----------
+      const dryRes = await apiFetch(`${base}/api/batch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ dryRun: true, roots: [dir], outputDir: outDir, preset, dedup: false }),
+      });
+      if (dryRes.status === 501) {
+        process.stdout.write('  (batch engine not available yet)\n');
+        return;
+      }
+      assertEq(dryRes.status, 200, 'dry run answered 200');
+      const dry = (await dryRes.json()) as {
+        plan?: { items: { outputPath: string }[] };
+        error?: string;
+      };
+      assertEq(
+        dry.plan?.items.length,
+        1,
+        `only the real track is planned, the staging name is not a track (${dry.error ?? 'no error'})`,
+      );
+      assert(existsSync(track), 'dry run left the real track in place');
+      assert(existsSync(leftover), 'dry run did NOT sweep the leftover staging file');
+
+      // --- 2. real run: sweeps first, then renders ---------------------
+      const runRes = await apiFetch(`${base}/api/batch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ roots: [dir], outputDir: outDir, preset, dedup: false }),
+      });
+      assertEq(runRes.status, 202, 'a real run is accepted as a job');
+      const { jobId } = (await runRes.json()) as { jobId: string };
+
+      interface JobView {
+        state: string;
+        report: unknown;
+        error: string | null;
+      }
+      let job: JobView | null = null;
+      for (let i = 0; i < 120; i += 1) {
+        const jr = await apiFetch(`${base}/api/jobs/${jobId}`);
+        const body = (await jr.json()) as { job: JobView };
+        job = body.job;
+        if (job && (job.state === 'done' || job.state === 'failed')) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      assert(job !== null, 'job is retrievable');
+      const settled: JobView = job!;
+      assertEq(settled.state, 'done', `batch job finished (error: ${settled.error})`);
+
+      assert(!existsSync(leftover), 'real run removed the leftover staging file');
+      assert(existsSync(track), 'real run kept the real track');
+
+      const report = settled.report as {
+        items: { status: string; message?: string }[];
+        stagingSweep?: { removed: string[]; notice: string | null };
+      };
+      assertEq(
+        report.stagingSweep?.removed.length,
+        1,
+        `the sweep reports exactly the one reclaimed file (got ${JSON.stringify(report.stagingSweep)})`,
+      );
+      assert(
+        report.stagingSweep?.notice === '已清除 1 個上次留下的暫存檔',
+        `the count is visible to the user (got ${JSON.stringify(report.stagingSweep?.notice)})`,
+      );
+      assert(
+        report.items.some((i) => i.status === 'ok'),
+        `the batch still converted the real track: ${report.items.map((i) => i.status).join(', ')}`,
+      );
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('end-to-end: /api/denoise rejects a missing input without crashing', async () => {
   await withServer(async ({ base }) => {
     const res = await apiFetch(`${base}/api/denoise`, {
@@ -643,4 +747,208 @@ test('end-to-end: /api/denoise rejects a missing input without crashing', async 
     const body = (await res.json()) as { ok: boolean };
     assertEq(body.ok, false, 'a missing input is reported as a failure');
   });
+});
+
+/* ------------------------------------------------------------------ */
+/* Loudness measurement endpoint                                       */
+/* ------------------------------------------------------------------ */
+
+/** A 1 kHz mono tone whose peak amplitude is exactly `amplitude`, for the measure route. */
+async function makeMeasureTone(scratch: string, name: string, amplitude: number): Promise<string> {
+  const out = join(scratch, name);
+  const res = await runFfmpeg(
+    findBinaries().ffmpeg,
+    [
+      '-hide_banner', '-y',
+      '-f', 'lavfi',
+      // No comma in the expression: it would be read as a filter separator.
+      '-i', `aevalsrc=${amplitude}*sin(2*PI*t*1000):s=44100:d=3`,
+      '-ac', '1',
+      '-c:a', 'pcm_s16le',
+      out,
+    ],
+    { cwd: scratch },
+  );
+  assert(res.code === 0, `could not build the ${name} fixture (ffmpeg exit ${res.code})`);
+  return out;
+}
+
+test('end-to-end: /api/measure reports the loudness of a real file', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'aus-measure-api-'));
+  try {
+    const tone = await makeMeasureTone(scratch, 'half.wav', 0.5);
+
+    await withServer(async ({ base }) => {
+      const res = await apiFetch(`${base}/api/measure?path=${encodeURIComponent(tone)}`);
+      assertEq(res.status, 200, 'a measurable file answers 200');
+
+      const body = (await res.json()) as {
+        ok: boolean;
+        path: string;
+        lufs: number;
+        truePeakDb: number;
+        lra: number;
+      };
+      assertEq(body.ok, true, 'ok');
+      assertEq(body.path, tone, 'the response names the file it measured');
+      assert(Number.isFinite(body.lufs), `lufs must be finite, got ${body.lufs}`);
+
+      // amplitude 0.5 is -6.02 dBFS; a true-peak meter may sit slightly above it.
+      assert(
+        Math.abs(body.truePeakDb - 20 * Math.log10(0.5)) < 0.5,
+        `true peak must match the fixture amplitude, got ${body.truePeakDb}`,
+      );
+      assert(
+        body.lufs < body.truePeakDb,
+        `loudness (${body.lufs}) must sit below the peak (${body.truePeakDb})`,
+      );
+    });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('end-to-end: /api/measure requires a path', async () => {
+  await withServer(async ({ base }) => {
+    const res = await apiFetch(`${base}/api/measure`);
+    assertEq(res.status, 400, 'no path is a client error, not a crash');
+
+    const body = (await res.json()) as { ok: boolean; error: string };
+    assertEq(body.ok, false, 'ok is false');
+    assert(body.error.includes('path'), `the error must name the missing field, got "${body.error}"`);
+  });
+});
+
+test('end-to-end: /api/measure reports a file that is not there', async () => {
+  await withServer(async ({ base }) => {
+    const missing = join(tmpdir(), 'definitely-absent-aus-measure.wav');
+    const res = await apiFetch(`${base}/api/measure?path=${encodeURIComponent(missing)}`);
+    assertEq(res.status, 404, 'a path that is not there is a 404');
+
+    const body = (await res.json()) as { ok: boolean; error: string };
+    assertEq(body.ok, false, 'ok is false');
+    assert(body.error.includes('no such file'), `the error must say so, got "${body.error}"`);
+  });
+});
+
+test('end-to-end: /api/measure fails on a file with no audio instead of returning a number', async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'aus-measure-bad-'));
+  try {
+    const notAudio = join(scratch, 'notes.txt');
+    writeFileSync(notAudio, 'not audio at all\n', 'utf8');
+
+    await withServer(async ({ base }) => {
+      const res = await apiFetch(`${base}/api/measure?path=${encodeURIComponent(notAudio)}`);
+      // Reporting a loudness of 0 here would make the row look like silence to
+      // normalise rather than a file that could not be read.
+      assertEq(res.status, 422, 'an unmeasurable file is reported, not measured as zero');
+
+      const body = (await res.json()) as { ok: boolean; error: string };
+      assertEq(body.ok, false, 'ok is false');
+      assert(body.error.length > 0, 'the reason is carried through');
+    });
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('end-to-end: /api/batch rejects a non-boolean overwrite instead of coercing it', async () => {
+  // `overwrite` decides whether the user's own files are replaced. A truthy string
+  // silently accepted here would mean a caller cannot tell a request that asked for
+  // replacement from one that only looked like it did.
+  await withServer(async ({ base }) => {
+    const res = await apiFetch(`${base}/api/batch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        dir: 'C:\\Music',
+        outputDir: 'C:\\Out',
+        preset: { id: 'usb' },
+        overwrite: 'yes',
+        dryRun: true,
+      }),
+    });
+    assertEq(res.status, 400, 'a string overwrite is a bad request');
+
+    const body = (await res.json()) as { ok: boolean; error: string };
+    assertEq(body.ok, false, 'ok is false');
+    assert(body.error.includes('overwrite'), `the error must name the field, got "${body.error}"`);
+  });
+});
+
+test('end-to-end: /api/batch rejects a malformed includePaths instead of ignoring it', async () => {
+  // Dropping a malformed selection would convert every file under the folder,
+  // including the ones the caller unticked — and a lossless original replaced by
+  // lossy MP3 cannot be recovered. It has to be a hard 400.
+  await withServer(async ({ base }) => {
+    const res = await apiFetch(`${base}/api/batch`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        dir: 'C:\\Music',
+        outputDir: 'C:\\Out',
+        preset: { id: 'usb' },
+        includePaths: ['C:\\Music\\a.mp3', 7],
+        dryRun: true,
+      }),
+    });
+    assertEq(res.status, 400, 'a non-string entry is a bad request');
+
+    const body = (await res.json()) as { ok: boolean; error: string };
+    assertEq(body.ok, false, 'ok is false');
+    assert(
+      body.error.includes('includePaths'),
+      `the error must name the field, got "${body.error}"`,
+    );
+  });
+});
+
+test('end-to-end: a dry run plans only the includePaths it was given', async () => {
+  // The page's tick-boxes are only real if the selection survives the HTTP hop and
+  // reaches the planner. This test is that wire, end to end.
+  if (!e2eBins) {
+    process.stdout.write('  (skipping: ffmpeg not found)\n');
+    return;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'aus-server-select-'));
+  const outDir = join(dir, 'usb');
+  mkdirSync(outDir, { recursive: true });
+
+  try {
+    await makeTone(dir, '01 - Alpha - First.wav', 440, 1);
+    await makeTone(dir, '02 - Beta - Second.wav', 660, 1);
+    const keep = join(dir, '01 - Alpha - First.wav');
+
+    await withServer(async ({ base }) => {
+      const preset = {
+        container: 'mp3', codec: 'libmp3lame', bitrateKbps: 320, sampleRate: 44100,
+        channels: 2, id3v2Version: 3, denoise: 'gentle',
+        loudness: { enabled: true, integratedLufs: -14, truePeakDb: -1, lra: 11 },
+      };
+
+      const res = await apiFetch(`${base}/api/batch`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          dryRun: true, roots: [dir], outputDir: outDir, preset, includePaths: [keep],
+        }),
+      });
+      if (res.status === 501) {
+        process.stdout.write('  (batch engine not available yet)\n');
+        return;
+      }
+      assertEq(res.status, 200, 'dry-run planning answered 200');
+      const dry = (await res.json()) as {
+        ok: boolean;
+        plan?: { items: { sourcePath: string }[] };
+        error?: string;
+      };
+      assertEq(dry.ok, true, `plan ok${dry.error ? `: ${dry.error}` : ''}`);
+      assertEq(dry.plan?.items.length, 1, 'only the selected file is planned');
+      assertEq(dry.plan?.items[0]?.sourcePath, keep, 'and it is the one that was selected');
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

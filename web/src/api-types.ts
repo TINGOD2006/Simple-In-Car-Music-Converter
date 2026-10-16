@@ -350,14 +350,70 @@ export interface PreviewRequest {
   outputPath?: string;
 }
 
+/**
+ * `POST /api/batch` body.
+ *
+ * `roots` is the engine's own name; `dir` is the convenience spelling
+ * `src/server/index.ts` accepts for a single root (`roots` wins when both are
+ * present). `overwrite` replaces each source in place through a staged file, so
+ * `outputDir` stays REQUIRED even then rather than being silently dropped.
+ *
+ * `filenamePattern` is deliberately left unset by the USB page: the engine then
+ * applies its own default `{artist} - {title}` (see `src/core/batch.ts:232`), which
+ * renames each output from its tags — measured on the user's real 199-file batch,
+ * 123 files were renamed this way, which is not something a conversion UI should do
+ * silently. `preserveNames` is the escape hatch the page opts into.
+ */
 export interface BatchRequest {
-  roots: string[];
+  roots?: string[];
+  dir?: string;
   outputDir: string;
   preset: ExportPreset;
   loudness?: LoudnessTarget | null;
   filenamePattern?: string;
   dedup?: boolean;
   targetCapacityBytes?: number | null;
+  /** Replace each source in place (staged, verified, then atomically renamed). */
+  overwrite?: boolean;
+  /**
+   * Restrict the batch to exactly these source paths.
+   *
+   * A scan of `roots` returns every audio file under it, so without this the page's
+   * tick-boxes would be decoration: an unticked lossless original would be converted
+   * anyway. An empty array converts nothing.
+   */
+  includePaths?: string[];
+  /**
+   * Keep every output's original basename instead of re-naming it from tags.
+   *
+   * Without this the engine's default `{artist} - {title}` pattern renames files
+   * that were only supposed to be re-encoded (123 of the 199 files in the user's
+   * real batch). The USB page always sends `true`: the user ticks rows to convert
+   * them, not to have their library reshuffled. The engine implements the flag.
+   */
+  preserveNames?: boolean;
+  /** Plan only: the engine answers inline with a plan instead of starting a job. */
+  dryRun?: boolean;
+}
+
+/**
+ * `GET /api/measure?path=...` — one loudness pass over one file.
+ *
+ * Failure modes are the reason this page exists in the shape it does: 400 for a
+ * missing `path`, 404 for a missing file, 422 when the file has no decodable audio
+ * stream. All three surface as `ApiError` from `api.measure`, and none of them is
+ * allowed to render as `0 LUFS` — that would look like silence rather than a
+ * failure.
+ */
+export interface MeasureResponse {
+  ok: true;
+  path: string;
+  /** Integrated loudness in LUFS (ffmpeg `input_i`). */
+  lufs: number;
+  /** True peak in dBTP (ffmpeg `input_tp`). */
+  truePeakDb: number;
+  /** Loudness range in LU (`input_lra`). */
+  lra: number;
 }
 
 export interface BatchStartResponse {

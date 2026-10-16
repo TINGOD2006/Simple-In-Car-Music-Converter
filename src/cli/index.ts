@@ -21,9 +21,9 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
+import { preferredScratchPath, probeScratchCandidates, tryResolveScratchRoot } from '../core/approot.ts';
 import { findBinaries } from '../core/ffbin.ts';
 import type { BinPaths } from '../core/ffbin.ts';
 import { probe } from '../core/probe.ts';
@@ -33,6 +33,11 @@ import { render, verify } from '../core/render.ts';
 import { planBatch, runBatch, writeManifest } from '../core/batch.ts';
 import type { BatchOptions, BatchReport } from '../core/batch.ts';
 import { scanLibrary } from '../core/library.ts';
+// The pre-run staging sweep is shared with `/api/batch`; it lives next to the HTTP
+// handler so the rule — "clean only this run's roots, only on a real run" — exists
+// once. Importing the server module is side-effect free: it only defines functions
+// (createAppServer/startServer), nothing listens until it is told to.
+import { sweepStaleStagingUnder } from '../server/index.ts';
 
 /* ------------------------------------------------------------------ */
 /* Tiny arg parser                                                     */
@@ -132,14 +137,26 @@ function presetByName(name: string): ExportPreset {
 interface Ctx {
   bins: BinPaths;
   scratch: string;
+  /**
+   * Non-empty when no scratch directory could be created anywhere.
+   *
+   * Startup deliberately continues anyway: a machine that refuses to create
+   * directories has to be *reportable*, and a command that dies while resolving
+   * `ctx` cannot report anything at all.
+   */
+  scratchRefusals: string[];
 }
 
 function makeCtx(flags: Parsed['flags']): Ctx {
   const dir = strFlag(flags, 'ffmpeg-dir') ?? undefined;
   const bins = findBinaries(dir);
-  const scratchRoot = strFlag(flags, 'scratch') ?? join(tmpdir(), 'audio-usb-studio');
-  mkdirSync(scratchRoot, { recursive: true });
-  return { bins, scratch: scratchRoot };
+  const requested = strFlag(flags, 'scratch');
+  const { root, refusals } = tryResolveScratchRoot(requested);
+  return {
+    bins,
+    scratch: root ?? requested ?? preferredScratchPath(),
+    scratchRefusals: refusals,
+  };
 }
 
 function abs(p: string): string {
@@ -155,6 +172,37 @@ async function cmdDoctor(ctx: Ctx, flags: Parsed['flags']): Promise<number> {
   console.log('ffprobe:', ctx.bins.ffprobe);
   console.log('found in:', ctx.bins.source);
   console.log('scratch:', ctx.scratch);
+
+  // Where this process may write is the most environment-dependent part of startup,
+  // and its failures are invisible from the outside: the program simply stops before
+  // it can say anything. Print the entire picture here, with every candidate probed
+  // by actually creating a file, so a blocked machine is diagnosable in one command.
+  const approot = await import('../core/approot.ts');
+  console.log('');
+  console.log('this process:');
+  console.log('  exe       :', process.execPath);
+  console.log('  cwd       :', process.cwd());
+  console.log('  appRoot() :', approot.appRoot());
+  console.log('  assetRoot :', approot.assetRoot());
+  console.log('  AUS_APP_ROOT   :', process.env.AUS_APP_ROOT ?? '(unset)');
+  console.log('  AUS_ASSET_ROOT :', process.env.AUS_ASSET_ROOT ?? '(unset)');
+  console.log('  TEMP / TMP     :', `${process.env.TEMP ?? '(unset)'} / ${process.env.TMP ?? '(unset)'}`);
+  console.log('  LOCALAPPDATA   :', process.env.LOCALAPPDATA ?? '(unset)');
+  console.log('  APPDATA        :', process.env.APPDATA ?? '(unset)');
+
+  console.log('');
+  console.log('scratch candidates (each probed by creating and deleting a file):');
+  const probes = approot.probeScratchCandidates();
+  for (const probe of probes) {
+    console.log(`  ${probe.ok ? 'OK    ' : 'DENIED'} ${probe.dir}`);
+    console.log(`         ${probe.detail}`);
+  }
+  if (ctx.scratchRefusals.length > 0) {
+    console.log('');
+    console.log('WARNING: no scratch directory could be created. Commands that need to');
+    console.log('         write intermediate files will fail until one of these works:');
+    for (const refusal of ctx.scratchRefusals) console.log(refusal);
+  }
 
   // Prove both binaries actually run, rather than only that the files exist.
   const { runFfmpeg } = await import('../core/ffbin.ts');
@@ -179,6 +227,11 @@ async function cmdDoctor(ctx: Ctx, flags: Parsed['flags']): Promise<number> {
           ffmpegExit: ff.code,
           ffprobeExit: fp.code,
           aiDenoise: { available: aiAvailable, exePath: aiPath },
+          appRoot: approot.appRoot(),
+          assetRoot: approot.assetRoot(),
+          scratch: ctx.scratch,
+          scratchRefusals: ctx.scratchRefusals,
+          scratchProbes: probes,
         },
         null,
         2,
@@ -635,6 +688,12 @@ async function cmdBatch(ctx: Ctx, positional: string[], flags: Parsed['flags']):
     for (const err of scan.errors) console.log(`  scan error: ${err.path}: ${err.message}`);
     return 0;
   }
+
+  // Same sweep as `/api/batch`, and deliberately after the dry-run return above:
+  // `--dry-run` promises to plan without writing, and deleting a previous crash's
+  // leftovers is a write. The staleness rules live in src/core/staging.ts.
+  const sweep = sweepStaleStagingUnder(opts.roots);
+  if (sweep.notice) console.log(`  ${sweep.notice}`);
 
   let lastStage = '';
   const report = await runBatch({

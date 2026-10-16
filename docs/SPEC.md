@@ -218,12 +218,13 @@ repair → denoise → eq → dynamics → space → gain → speed
 |---|---|---|
 | GET | `/api/health` | ffmpeg/ffprobe 路徑、scratchRoot、node 版本 |
 | GET | `/api/library?dir=&recursive=` | 掃描資料夾 |
+| GET | `/api/measure?path=` | 量測單檔響度（一遍 `loudnorm` 分析）。回 `{ok,path,lufs,truePeakDb,lra}`。缺 `path` 回 400、不存在回 404、無法量測（無音訊串流／不可讀）回 **422**——回 0 會讓不可讀的列看起來像靜音，而不是壞檔 |
 | POST | `/api/probe` | 單檔探測 |
 | GET | `/api/waveform?path=&buckets=` | 波形峰值 |
 | POST | `/api/compile` | 回傳精確 argv + filterComplex（UI 顯示真正指令） |
 | POST | `/api/render` | 渲染（可帶 `doVerify`） |
 | POST | `/api/preview` | 效果試聽；**直接回傳 `audio/wav` 位元組**（不再回一個瀏覽器取不到的路徑） |
-| POST | `/api/batch` | `dryRun:true` 同步回 plan；否則 202 + jobId |
+| POST | `/api/batch` | `dryRun:true` 同步回 plan；否則 202 + jobId。`overwrite:true` 就地取代原檔（見 §9.2）；`overwrite` 非布林回 400。`includePaths:string[]` 限定只處理這些來源（見 §9.3）；格式錯誤回 400 |
 | GET | `/api/jobs` / `/api/jobs/:id` | 任務列表 / 單一任務 |
 | GET | `/api/denoise-availability` | DFN 是否可用 |
 | POST | `/api/denoise` | 單曲 AI 降噪 |
@@ -240,6 +241,192 @@ server 只綁 `127.0.0.1`，仍以**音訊副檔名白名單**收斂暴露面：
 
 尚未落地的模組（`library` / `batch` / `denoise`）由 `optionalModule()` 動態載入，
 缺席時端點回 **501** 加明確訊息，**不會**讓 typecheck 或啟動失敗。
+
+### 9.2 為什麼 `overwrite` 是安全閥而不是開關
+
+`overwrite:true` 會**就地取代使用者的原檔**。USB 上的音樂庫往往是唯一一份，所以
+這裡刻意不寫成「把 `outputDir` 換成來源目錄」那種等價形式，而是另一條渲染路徑：
+
+1. **先寫暫存檔**，位置在原檔**同一個目錄**（因此同一個磁碟區）。暫存檔帶目標副檔名
+   （`<原名>.aus-tmp-xxxx.mp3`），否則 ffmpeg 選不到 muxer。
+2. 渲染後**用 ffprobe 複驗**（時長、聲道、取樣率、響度都在容忍值內）。
+3. **驗證有問題就拒絕取代**：刪掉暫存檔並把該列標為失敗。非覆寫模式只是把問題記進
+   `message`；覆寫模式必須更嚴格——它要弄丟的是一份可用的原檔。
+4. 驗證通過才 `rename` 覆蓋（同一磁碟區的 rename 是原子操作）。若目標副檔名與來源不同
+   （例如 `.wav` → `.mp3`），`rename` **之後**才刪來源——順序永遠是先寫新的、再刪舊的。
+5. 任一步失敗都只影響那一列：原檔一字不動，`.aus-tmp-*` 由 `discardStaged()` 清掉。
+
+`outputDir` 在覆寫模式下被忽略但仍必填，而且是刻意的：讓「就地取代」與「寫到別的地方」
+在呼叫端只差一個布林，比要求呼叫端永遠說清楚它想寫哪裡要危險得多。
+
+**實測**（真實 ffmpeg，非字串斷言）：對含 2 個檔案的目錄跑一次 `overwrite` 批次 →
+job `done`、progress 2/2、兩列 `ok` 且 `verify: ok`、報告回的 `outputPath` 就是磁碟上實際
+存在的檔案、原 `.wav` 已被取代、**沒有任何 `.aus-tmp-*` 殘留**、`outputDir` 沒有被建立。
+
+### 9.3 為什麼 `includePaths` 必須存在
+
+`roots` 只能說「去哪裡找」，不能說「在你找到的檔案裡，只處理這幾個」。少了 `includePaths`，
+UI 的勾選框就只是裝飾：使用者刻意不勾的無損原檔，會因為剛好躺在被選取的文件夾底下而被轉成
+MP3，而那是不可逆的。
+
+因此 `POST /api/batch` 接受 `includePaths: string[]`，`planBatch()` 在**做任何其他判斷之前**
+先用它過濾（路徑先 `resolve`、大小寫不敏感，因為 Windows 呼叫端對大小寫沒有共識）。空陣列是
+合法的，意思是「什麼都不轉」；格式錯誤（非陣列、含非字串）回 **400**——忽略一份壞掉的選取
+清單，正好會轉換使用者取消勾選的那些檔案。
+
+**實測**：來源目錄放一個無損 `Keep-Lossless.wav` 與一個 128 kbps `Convert-Me.mp3`，只把 mp3
+放進 `includePaths`，跑真正的 `overwrite` 批次：
+
+| | 之前 | 之後 |
+|---|---|---|
+| `Keep-Lossless.wav`（未勾選） | sha256 `4194aa4787c98434` | **`4194aa4787c98434`（完全相同）** |
+| `Convert-Me.mp3`（已勾選） | 48,945 B / 128 kbps | 122,319 B / 320 kbps |
+| `.aus-tmp-*` 殘留 | — | 無 |
+
+dry run 亦確認 plan 只有 1 項且正是 `Convert-Me.mp3`。
+
+### 9.4 `.aus-tmp-` 是契約字串，不是實作細節
+
+暫存檔的命名是 `<原名>.aus-tmp-<6 字><副檔名>`（見 9.2），它必須**刻意保留目標副檔名**，
+否則 ffmpeg 選不到 muxer——代價是 `Song - Artist.aus-tmp-u9nvkk.mp3` 在只看副檔名的程式眼裡
+就是一支 `.mp3`。2026-10-16 的事故就是這樣來的：崩潰殘留的暫存檔被掃成一支真曲目，批次再把它
+改名到它已經佔住的名字上，製造出 `Song - Artist (2).mp3`。
+
+所以這個字串只有一個出口：`src/core/staging.ts` 的 `STAGING_MARK` 與 `isStagingName()`。
+判斷必須是**大小寫不敏感的子字串**比對，**不能**用 `extname()`（`.aus-tmp-u9nvkk.mp3` 的
+`extname()` 就是 `.mp3`），而且掃描與清掃兩側共用同一個判斷式，兩邊不可能對「什麼是暫存檔」
+產生分歧。
+
+**掃描側**：`library.ts` 的 `walk()` 在拿到 `Dirent` 的第一件事就
+`if (isStagingName(d.name)) continue;`——在 `extname()` 之前、在 `join()` 之前。暫存檔因此
+連一次 ffprobe 都不會被問到，也不可能出現在 `entries` 或 `errors` 裡。
+
+**清掃側**：`sweepStaleStaging(dirs, olderThanMs = 1 小時)` 只刪暫存**檔**，且候選必須同時
+通過兩道規則：
+
+| 規則 | 條件 | 為什麼 |
+|---|---|---|
+| (a) 已經舊了 | `mtime` 早於 `now - olderThanMs` | 剛開始寫的暫存檔是活的 |
+| (b) 沒人在用 | `openSync(file, 'r+')` 成功 | 別的行程正在寫的暫存檔，刪掉就是弄丟那次的成果 |
+
+任何一關沒過就是保留。`statSync` 失敗（事故現場的損壞目錄項，`errno -4094`）保守地保留；
+目錄與符號連結永遠不刪、也不跟隨；`kept` 只列「被找到但沒刪的暫存檔」，非暫存檔與目錄
+完全不出現在回傳值裡——沉默代表「不甘我的事」。
+
+**Windows 實測限制（別對規則 (b) 抱錯誤期待）**：Node/libuv 開檔用
+`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`，所以**同一行程**已持有 fd 時，
+第二次 `openSync('r+')` 會成功、`unlinkSync` 也會成功——規則 (b) **看不見同行程的持有者**。
+它真正擋住的是**另一個行程**以 `FileShare.None` 取得的獨佔持有（實測 `openSync('r+')`
+回 `EBUSY`），以及讓路徑根本開不起來的損壞（上述 `-4094`）。測試因此分兩條，兩條都在同一個
+目錄放一個**同齡、沒人持有**的對照暫存檔，並斷言它在同一輪被刪除——否則「保留」可能只是
+什麼都沒做：
+
+- `staging: a stale staging file held open by an exclusive writer is kept, not deleted`
+  ——子行程以 `FileShare.None` 獨佔持有（真 `EBUSY`）。
+- `staging: a stale staging file this process holds open via openSync is kept when it cannot
+  be opened for write`——行程內 `openSync` 持有該 fd，並以 `fchmodSync(fd, 0o444)` 讓它
+  不可寫（Windows 會設 `FILE_ATTRIBUTE_READONLY`，探測回 `EPERM`）。這是 Windows 上
+  **唯一能單獨歸因給規則 (b)** 的情境：開不了寫入，卻刪得掉。
+- `staging: a stale staging file another process holds with write sharing is kept even though
+  we can open it`——子行程以 `FileShare.ReadWrite` 持有（libuv 的形狀，也就是另一個
+  AudioUsbStudio 實例正在渲染同一支曲目）。這裡 `openSync('r+')` **會成功**，規則 (b)
+  看不見持有者，真正保住它的是「`unlinkSync` 失敗（`EBUSY`）即保留」那一關；測試先斷言
+  「我們真的開得起來」這個前提，否則它會因為無聊的理由而通過。
+
+（三條規則 (b) 測試都做過突變檢查：把 `canOpenForWrite()` 強制回 `true`，只有 read-only
+那條轉紅；把 `unlinkSync` 的 try/catch 拿掉，只有 `FileShare.ReadWrite` 那條轉紅。兩關都
+不是裝飾品。）
+
+**實測**：`library:` 側亦有一條測試在「真檔 + 同目錄同齡 `.aus-tmp-` 檔（含子目錄）」下
+只回 1 個 entry、`ffprobe` 也只被問過那一個檔；`node test/run.ts` 全綠。
+
+### 9.5 就地轉換不改檔名，目標名不可用時要說人話
+
+**`preserveNames`：改名是事故，不是功能。** 真實事故：一次 `overwrite` 批次把 199 個檔中的
+123 個改成 `{artist} - {title}`，其中同名的兩首被 `planFilenames()` 綴成 `X.mp3` 與
+`X (2).mp3`。使用者要的是「把這些檔轉成 MP3」，不是「幫我重新命名」。所以 `overwrite:true`
+的預設是 `preserveNames:true`：
+
+- 目標名就是來源自己的名字。副檔名**不分大小寫相同時逐字保留**（`TRACK.MP3` 不會變成
+  `TRACK.mp3`）；容器真的改變時才換成 preset 的副檔名（`song.wav` → `song.mp3`），否則
+  檔案內容會跟它的名字互相說謊。
+- **不套用 `filenamePattern`**，也**永不產生 `(2)`**。
+- 要標籤命名就明確傳 `preserveNames:false`；`overwrite:false`（匯出到別的目錄）行為完全不變。
+- `POST /api/batch` 接受 `preserveNames`，非布林回 **400**——把壞掉的值強制轉型，正好會
+  重新命名使用者要求不要動的檔案庫。
+
+§9.2 的「先寫暫存檔 → 複驗 → 才覆蓋」流程不變，變的只有目標檔名怎麼決定。
+
+**目標名不可用時**：損毀的 FAT32 目錄項佔住某個檔名時，`statSync(finalPath)` 丟的是
+`UNKNOWN: unknown error`（node errno -4094）——**不是** ENOENT。因此判斷原則寫成「**除了
+乾淨的 ENOENT 以外都算這個名字不能用**」，不窄化成特定 errno、也不比對訊息文字。（實測：
+本機 NTFS 上除了 NUL byte 之外合成不出這個錯誤，`?`、`:`、保留名 `CON`、超長名、>MAX_PATH
+全部回 ENOENT，所以真實裝置的那個 errno 只能靠單元測試覆蓋「非 ENOENT」分支。）
+
+rename **之前**先探測，因為 rename 之後原檔就沒了，那是最後一個還能保護它、也還能解釋的時刻：
+
+| 探測結果 | 行為 |
+|---|---|
+| `ENOENT`（目標不存在） | 照舊 rename |
+| 目標是目錄，或 `stat` 丟非 ENOENT | 該列 `failed`：`目標檔名在這台裝置上損毀，無法寫入：<檔名>。請用磁碟檢查工具修復這個資料夾，或先在電腦上轉換後再複製回來。（<裝置／探測的原始說法>）` |
+| 目標是別人的一般檔案 | 該列 `failed`，訊息指明該檔名被佔用；不覆蓋、不刪除 |
+| `rename` 本身失敗 | 同一個句式，並附上 rename 的**原始錯誤文字** |
+
+無論哪一種：`discardStaged()` 清掉暫存檔，**原檔一位元組都不動（mtime 也不動）**，
+`outputPath` 回 `null`（不謊報一個不存在的路徑）。
+
+**順手修掉的兩個靜默資料遺失**（保留檔名之後才變得可達）：
+
+1. 同目錄有既存的 `song.mp3`，同批次的 `song.flac`（preset mp3）目標也是 `song.mp3`：舊行為
+   會覆蓋那個既存檔、再把自己當成「已被取代的來源」刪掉。現在前者讓後者 `skipped`
+   （`target name is taken by an existing file (song.mp3)`）；同一批次內兩首搶同一個還不存在
+   的名字時，先到者得，後者 `skipped`（`target name is already claimed by another track in
+   this batch`）。兩者都排在 dedup 與容量判斷**之後**，所以被丟棄的項目不會佔走名字。
+2. 刪除來源原本用 `resolve()` 比字串。來源 `TRACK.MP3`、目標 `Track.mp3` 在 Windows 上是
+   **同一個目錄項**，舊碼會把剛剛寫好的轉檔刪掉。改用 `realpathSync()` 比較（`isSameFile`）。
+
+**實測**（真實 ffmpeg 批次，非字串斷言）：`INTEGRATION: overwrite refuses a damaged
+destination name and leaves the original intact`（同名目錄佔位 → `failed`、訊息含檔名與可行動
+建議、原檔 bytes **與 mtime 完全相同**、佔位目錄未被刪、無 `.aus-tmp-` 殘留）；
+`INTEGRATION: in-place overwrite keeps the original names by default`（兩個原本會撞成
+`X.mp3`／`X (2).mp3` 的檔各自保留原名，且顯式傳入的 `filenamePattern` 被忽略）；
+`INTEGRATION: preserveNames:false still re-organises in-place by the tag pattern`；
+`INTEGRATION: in-place naming keeps a source name that already has the preset extension`
+（`TRACK.MP3`）；`INTEGRATION: an in-place conversion never claims a name another file already
+uses`（既存檔 bytes 不變、批次外檔案不被動到）。
+
+### 9.6 清掃暫存檔的時機：真跑之前，dry run 永遠不清
+
+§9.4 的 `sweepStaleStaging()` 原本只被交付、沒有任何呼叫端。後果不是理論：上一次崩潰留下的
+`.aus-tmp-*.mp3` 會一直躺在隨身碟上（實測 8 個、76.7 MB），而那個名字正是「與真檔撞名後
+產生 `(2)` 重複檔」那條事故的來源。
+
+**時機與範圍**（`sweepStaleStagingUnder()`，定義在 `src/server/index.ts`，HTTP 與 CLI 共用
+同一支；放在這裡而不是新模組，是因為本次變更的寫入範圍就是這四個檔案。`src/cli/index.ts`
+以 `import { sweepStaleStagingUnder } from '../server/index.ts'` 取用 —— 該模組在 import 時
+只定義函式，不會開始監聽）：
+
+| 情況 | 行為 |
+| --- | --- |
+| `/api/batch` 且 `dryRun: true` | **完全不清掃**：handler 在 dry-run 分支就 return，清掃寫在 job callback 內，dry run 到不了那一行 |
+| `/api/batch` 真跑 | job 開始後、`runBatch` 之前清掃本次的 `roots`（含子目錄） |
+| CLI `batch` | `--dry-run` 在清掃之前 return；真跑清掃同一組 roots |
+| 清掃範圍 | 只有本次的 `roots`，每個先 `resolve()` 後去重；不往上層目錄走、不掃整個磁碟區 |
+| 清掉 N > 0 | job 進度顯示 `已清除 N 個上次留下的暫存檔`；完成後的 job report 也帶 `stagingSweep: { removed, notice }`；CLI 直接印同一行 |
+| 清掉 N = 0 | 不顯示任何訊息（`notice: null`）——每次掃描都吵「清除 0 個」只會被使用者學會忽略 |
+| 清掃本身失敗（root 不可讀／字串不合法） | 吞掉：清掃是附加工作，不能讓批次因此失敗；壞掉的 root 由掃描自己回報 |
+
+「什麼算過期」仍然是 `src/core/staging.ts` 的兩條規則（mtime 門檻 + 開不了檔就保留），這裡
+只決定**何時**問、**問哪些目錄**，不重寫判定，所以兩邊不會漂移。dry run 不清掃也不是禮貌
+問題：dry run 的契約是「不改動磁碟」，刪檔就是改動。
+
+**實測**（`test/server.test.ts`，真 ffmpeg）：`end-to-end: a real batch sweeps a previous
+crash's staging file, a dry run does not` —— 目錄內放 `song.mp3` 與 mtime 被推到 2 小時前的
+`song.aus-tmp-abc123.mp3`：
+
+- dry run → 200，計劃只有 **1** 條（暫存名不算曲目），之後**兩個檔案都還在**；
+- 真跑 → 暫存檔**已被刪除**、`song.mp3` **仍在**（且照常被轉檔），job report 的
+  `stagingSweep.removed` 恰 1 筆、`notice` 逐字為 `已清除 1 個上次留下的暫存檔`。
 
 ---
 
@@ -259,7 +446,7 @@ npx tsc --noEmit    # 零 error
 npx vite build      # 必須成功產出 dist/
 ```
 
-**現況（M1+M2 完成）**：typecheck 零 error、**173/173 passed**、web 兩道門檻
+**現況（M1+M2 完成）**：typecheck 零 error、**227/227 passed**、web 兩道門檻
 皆過。測試含真實 ffmpeg 端到端驗證，而非字串斷言，例如：
 
 | 驗證項 | 量測方式 | 實測結果 |
@@ -335,5 +522,23 @@ UI 只做顯示與送意圖，**零 DSP**；所有音訊處理都在 Node 引擎
 3. 引擎端播放改用 `api.fileUrl(activeSource.path)`（`/api/file?path=`），取代先前由 basename 推導、實際永遠解析不到的那個 URL；`<audio>` 的 `onError` 會把真正的原因顯示出來。
 
 **錯誤不再被吞掉**：`store.ts` 有可逐條關閉的錯誤清單（上限 4 條）與進度提示行，`ApiError` 帶著 HTTP 狀態與伺服器 `error` 字串；`window` 的 `unhandledrejection` 與 `error` 也一併顯示。改動前失敗是靜默的，這正是「按什麼都沒反應」的來源。
+
+### 11.5 桌面版外殼（v0.2）
+
+同一個引擎有第二個前端：一個真正的 Windows 視窗。規格、架構與驗收證據見 **[`SPEC-DESKTOP.md`](SPEC-DESKTOP.md)**。
+
+| | 網頁版（v0.1） | 桌面版（v0.2） |
+|---|---|---|
+| 啟動 | `AudioUsbStudio.exe serve` → 自己開瀏覽器 | 雙擊 `AudioUsbStudio.exe` → 出現視窗 |
+| 程序主控台 | 有（PE 子系統 3） | 無（PE 子系統 2，`WinExe`） |
+| UI | 外部瀏覽器分頁 | 內嵌 WebView2 控制項 |
+| 原生檔案對話框 | `POST /api/pick`（引擎端 PowerShell） | 外殼的 `OpenFileDialog`／`FolderBrowserDialog`，經 `chrome.webview` 訊息通道 |
+| 發行 | `release\`（541 MB） | `dist\AudioUsbStudio-0.2.0-win-x64\`（651 MB，自帶 .NET 執行階段） |
+| 引擎 | 同一顆 `AudioUsbStudio.exe`（`--self-contained` 的 Node SEA） | 同一顆，改名為 `engine\AudioUsbStudio.Engine.exe`，**零改動** |
+| 批次／CLI | `AudioUsbStudio.exe batch …` | `engine\AudioUsbStudio.Engine.exe batch …` |
+
+外殼**不碰 DSP**：它只負責挑一個自由埠、把引擎當子行程啟動（用 Win32 Job Object 綁生命週期，關窗即連坐）、等 `/api/health` 回答、然後把該位址載入 WebView2。引擎那一側的程式碼與 195 個既有測試**一行未改**（`git status --porcelain -- src test` 的已追蹤檔案修改數為 0）。
+
+`api.pick` 因此在瀏覽器與外殼裡都能用，三層降級：外殼橋接 → 引擎端 `POST /api/pick` → 瀏覽器上傳（`NoNativeDialogError`）。
 
 

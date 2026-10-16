@@ -1,6 +1,6 @@
 # AudioUsbStudio 桌面版規格（v0.2）
 
-> 狀態：**草案，待核可**。依「討論 → 確認 → 寫規格 → 核可 → 才實作」的順序，本文件尚未開始實作。
+> 狀態：**已實作**（2026-10-14）。規格 → 實作計畫 `docs/superpowers/plans/2026-10-13-desktop-shell.md`（14 個任務全部完成，過程裁決記於同名 `.ledger.md`）→ 產物 `dist/AudioUsbStudio-0.2.0-win-x64/`。驗收結果見 §13。
 > 使用者決策（2026-10-13）：外殼採 **A（C# WinForms + WebView2）**；發行採 **免安裝綠色版**；第一版 **不動 ffmpeg**。
 
 ---
@@ -219,20 +219,140 @@ tools/
 
 ---
 
-## 13. 動工前已完成的前置驗證（實測證據）
+## 13. 驗收結果（實測證據）
 
-**`dotnet build` 可產生 WinForms + WebView2 的 GUI 執行檔——已證實。**
+14 個任務全部完成。下表每一列都是實際跑出來的輸出，不是推論。
+
+| # | 驗收項 | 指令 | 結果 |
+|---|---|---|---|
+| 1 | 外殼可建置 | `node desktop/build-shell.mjs` | `dotnet exit 0`，產出 `build/shell/` |
+| 2 | PE 子系統 = 2（GUI，無主控台） | `node tools/check-shell-binary.mjs dist\AudioUsbStudio-0.2.0-win-x64\AudioUsbStudio.exe` | `size 0.2 MB (162304 bytes)`、**`SUBSYSTEM 2 (WINDOWS_GUI)`**、exit 0 |
+| 3 | 外殼測試 | `dotnet run --project desktop\tests -c Release` | **60/60 passed**，exit 0 |
+| 4 | 既有引擎回歸 | `npm run typecheck` / `npm test` | typecheck exit 0；**208/208 passed**（原始 195 + 桌面工作新增 13） |
+| 5 | 前端回歸 | `npx tsc --noEmit` / `npx vite build` | 兩者 exit 0；`dist/assets/index-CFERG0k9.js` 210.10 kB（gzip 67.33） |
+| 6 | 引擎原始碼未被改動 | `git status --porcelain -- src test` | 已追蹤檔案的修改／刪除 = **0**（僅兩個新增測試檔未追蹤） |
+| 7 | 發行佈局 | `node tools/build-desktop-release.mjs` | exit 0 → `dist/AudioUsbStudio-0.2.0-win-x64/`，**651.4 MB / 232 檔** |
+| 8 | 引擎 CLI 仍可獨立使用 | `dist\…\engine\AudioUsbStudio.Engine.exe doctor` | exit 0；`found in: …\engine\bin`；**`AI denoise: available — …\engine\bin\deep-filter.exe`** |
+| 9 | 可攜性 | 整個 dist 複製到 `%TEMP%\aus-shell-portable\` 後再跑同一條 `doctor` | exit 0，三條路徑全部改指**新位置**的 `engine\bin` |
+
+**體積**：規格 §6 估 ~611 MB，實測 **651.4 MB**。差額來自自帶的 .NET WinForms 執行階段（磁碟上約 110 MB，不是當初假設的 ~70 MB）。記在 ledger 的 R12。
+
+### 13.1 尚未驗證（沙箱沒有 GUI 工作階段）
+
+以下四項**沒有**實機驗證，不得視為已通過：
+
+1. **視窗真的出現**——PE 子系統是 2、行程存活、`/api/health` 有回應，但沒有任何測試看過一個真實視窗。
+2. **WebView2 真的把 UI 畫出來**——頁面資產、路由與 bundle 都已驗證，但未在 WebView2 裡渲染過。
+3. **原生 modal 對話框**——`NativeDialog` 的純函式（濾鏡字串、大小寫不敏感去重）有測試；`OpenFileDialog`／`FolderBrowserDialog` 本身的顯示與選取結果沒有。
+4. **橋接訊息的實際往返**——`BridgeProtocol` 與 `bridgePick` 都有測試，但沒有一次是外殼與頁面之間真的對話。
+
+要補齊這四項，需要在有桌面工作階段的機器上雙擊 `dist\AudioUsbStudio-0.2.0-win-x64\AudioUsbStudio.exe`。
+
+### 13.2 動工前的前置驗證（仍然成立）
 
 | 項目 | 結果 |
 |---|---|
 | .NET SDK | 10.0.400（另裝有 10.0.103） |
-| `Microsoft.WindowsDesktop.App.Ref` 目標套件 | 存在 → WinForms 可建置 |
-| WindowsDesktop 執行階段 | 6.0.36 / 8.0.30 / 10.0.3 / 10.0.11 |
+| `dotnet build` 離線探針 | **exit 0，建置成功**（23.02 秒），PE 子系統 = **2 = `WINDOWS_GUI`** |
+| 離線 NuGet 來源 | node 預抓 nupkg → 本地來源還原成功（`desktop/build-shell.mjs`） |
 | WebView2 執行階段 | 154.0.4258.62 |
-| `dotnet build` 離線探針 | **exit 0，建置成功**（23.02 秒） |
-| 產出 | `AUSShellProbe.exe` 158.5 KB + `Microsoft.Web.WebView2.Core.dll` 621.1 KB + `WinForms.dll` 38.6 KB + `Wpf.dll` 80.6 KB ＝ **1.6 MB** |
-| **PE 子系統** | **2 = `WINDOWS_GUI`** → 編成 GUI 執行檔、**不會有黑色主控台** |
-| 離線 NuGet 來源 | node 預抓 8.45 MB nupkg → 本地來源還原成功 |
 | 唯一警告 | `MSB3277`（WPF 帶入 `WindowsBase` 4.0 vs 5.0 衝突）→ 只引用 Core+WinForms 即可避免 |
 
-**尚未驗證**：`WebView2` 控制項在真實 GUI 工作階段的實際渲染（沙箱無桌面工作階段）。
+---
+
+## 14. 驗收後的修復（F1）
+
+第一版出貨後，使用者雙擊 `AudioUsbStudio.exe` 得到：
+
+```
+the engine exited with code 1 (attempt 5 of 5)
+--- engine log tail (C:\Users\TINGOD\AppData\Local\AudioUsbStudio\engine.log) ---
+(no engine log was written)
+```
+
+沒有視窗，而且訊息指向一個從未被建立的檔案。真正的死在 `dist\...\engine\AudioUsbStudio-error.log`（引擎 exe 旁）裡：
+
+```
+Error: EPERM: operation not permitted, mkdir '...\Temp\aus-app-0.1.0-m1-...'
+    at mkdirSync (node:fs)
+    at extractEmbedded (tools/launcher.cjs)
+```
+
+`%TEMP%` 在該機器上拒絕 `mkdir`。以下是當時錯的五件事，以及現在的作法：
+
+| # | 當時的假設 | 現在的作法 |
+|---|---|---|
+| 1 | 解壓只有 `%TEMP%\aus-app-*` 一個地點，失敗即 `process.exit(1)` | 依序試 `%TEMP%` → `%LOCALAPPDATA%\AudioUsbStudio\runtime` → `%APPDATA%\AudioUsbStudio\runtime` → `<exe 目錄>\.aus-runtime-<stamp>`，全部失敗才終止，並列出每個地點的錯誤 |
+| 2 | 建立 `engine.log` 失敗被 `catch { }` 吞掉 | 失敗時記下原因，並在錯誤畫面一開頭就寫明「無法建立日誌（路徑）：原因」 |
+| 3 | `LogTail()` 只讀 `engine.log` | 另外讀引擎 exe 旁的 `AudioUsbStudio-error.log`，讀不到時明說「沒有任何東西被寫進 `<path>`」，而不是含糊的「沒有日誌」 |
+| 4 | 啟動失敗無條件重試 5 次 | 一旦 unpacker 寫下 `AudioUsbStudio-error.log`，立刻停止重試（重試不可能改善的事只是讓使用者多等五倍） |
+| 5 | scratch root 固定是 `%TEMP%\audio-usb-studio` | `resolveScratchRoot()` 同樣四處降級，最後退到 `<appRoot()>\.aus-scratch` |
+| 6 | 測試只啟動 `release\AudioUsbStudio.exe` | 測試優先啟動 `dist\AudioUsbStudio-*-win-x64\engine\`，並有一條測試專門斷言這個優先序 |
+
+**實測**（`release\` 與出貨的 `engine\` 皆同）：把 `TEMP` 指向一個「上層是檔案」的路徑使 `mkdir` 得到 `ENOTDIR`，`doctor` 仍 exit 0 並印 `scratch: ...\.aus-scratch`，且**沒有**寫下 unpacker 日誌。
+
+**尚未驗證**：這只證明引擎能在不可寫的 `%TEMP%` 下啟動。視窗是否真的出現，仍待使用者在有桌面工作階段的機器上確認。
+
+---
+
+## 15. 驗收後的修復（F2）
+
+修完 F1 之後再試，仍然失敗——這次終於有了完整的堆疊：
+
+```
+System.UnauthorizedAccessException: Access to the path
+  'C:\Users\TINGOD\AppData\Local\AudioUsbStudio\WebView2' is denied.
+   at System.IO.FileSystem.CreateDirectory(String fullPath, Byte[] securityDescriptor)
+   at System.IO.Directory.CreateDirectory(String path)
+   at AudioUsbStudio.Shell.MainForm.EnsureWebViewAsync(Int32 port)
+   at AudioUsbStudio.Shell.MainForm.StartEngineAsync(CancellationToken ct)
+```
+
+這個路徑與 F1 的不同，但仍在 `%LOCALAPPDATA%` 底下。兩次失敗落在同一個使用者設定檔的兩個不同位置，代表那不是偶發，而是**這個設定檔拒絕建立目錄**。
+
+反證就寫在 F1 的堆疊裡：第一次失敗時，unpacker 退到 `<exe 目錄>\.aus-runtime-<stamp>` 之後就成功了。**執行檔旁邊是這台機器上唯一被證明可寫的位置。**
+
+所以真正錯的是第三次踩同一個假設——「系統提供的目錄一定可寫」：
+
+| # | 當時的假設 | 現在的作法 |
+|---|---|---|
+| 1 | `%LOCALAPPDATA%\AudioUsbStudio` 可以寫（引擎日誌、shell 崩潰日誌都寫這裡） | 以**真實寫入**逐一探測：`%LOCALAPPDATA%\AudioUsbStudio` → `%APPDATA%\AudioUsbStudio` → `<shellDir>\data` → `%TEMP%\AudioUsbStudio`，第一個成功者勝出；全失敗才報錯並列出每一條拒絕原因 |
+| 2 | `%LOCALAPPDATA%\AudioUsbStudio\WebView2` 可以寫 | 改用解析出的目錄下的 `WebView2` 子目錄；建不起來時明說**是哪個資料夾**被拒、原因是什麼，而不是把一疊堆疊當訊息 |
+| 3 | 建目錄成功就等於可以寫 | 探測會多寫一個 probe 檔再刪掉——建立目錄與可寫是兩件事 |
+| 4 | 被拒只是權限問題 | 同時檢查「是不是有一個**檔案**佔住了目錄的位置」；那種拒絕與權限無關，訊息卻最容易被誤讀 |
+
+`ShellPaths.EngineLogPath` / `ShellErrorLogPath` / `UserDataDir` 現在都接受**已解析的路徑**，不再各自去讀 `%LOCALAPPDATA%`。程式碼中已無任何單一的設定檔路徑假設——剩下的 `GetFolderPath`／`GetTempPath` 呼叫全都只是候選清單本身。
+
+**實測**：`dotnet run --project desktop\tests` → `66/66 passed`。故意在候選位置放一個檔案時，解析會跳過它、回報 `exists as a file, not a folder`，並採用下一個可寫的位置。
+
+**尚未驗證**：這仍只證明解析邏輯正確。視窗是否真的出現，要由使用者再雙擊一次確認。
+
+---
+
+## 16. 驗收後的修復（F3）：勾選框不是裝飾
+
+收窄範圍後的新頁面（`web/src/components/UsbTab.tsx`）提供「只處理勾選的檔案」。第一版只做到
+提示與警告，沒有把選擇傳下去——引擎的批次 API 以資料夾為單位，所以**未勾選的無損原檔仍會被
+轉成 MP3**。頁面甚至把這件事明白寫出來，並要求使用者自己先把檔案移出工作區。
+
+那不是安全閥，那是一段要求使用者替程式想辦法的說明文字。無損轉有損不可逆，所以修法是把選擇
+做成 API 契約，而不是加警告：
+
+| # | 當時的作法 | 現在的作法 |
+|---|---|---|
+| 1 | `POST /api/batch` 只吃 `roots`／`dir`，無法表達「只處理這幾個檔」 | 新增 `includePaths: string[]`；`planBatch()` 在做任何其他判斷**之前**先過濾（`resolve` 後比對、大小寫不敏感） |
+| 2 | 格式錯誤的選取清單會被忽略，等於全轉 | 非陣列或含非字串 → **400**；空陣列合法＝什麼都不轉 |
+| 3 | 頁面的勾選框只是整理依據 | `UsbTab` 把已勾選的路徑放進 `includePaths`，引擎只碰這些檔 |
+| 4 | 警告使用者「未勾選的無損檔仍會被轉成 MP3」 | 警告改為「未勾選的無損檔<strong>不會</strong>被處理，原檔保持無損」 |
+
+**實測**（真實 ffmpeg、真實 HTTP、真實就地覆寫）：目錄內放無損 `Keep-Lossless.wav` 與
+128 kbps `Convert-Me.mp3`，只勾選 mp3，跑真正的 `overwrite` 批次：
+
+| | 之前 | 之後 |
+|---|---|---|
+| `Keep-Lossless.wav`（未勾選） | sha256 `4194aa4787c98434` | **`4194aa4787c98434`（位元組完全相同）** |
+| `Convert-Me.mp3`（已勾選） | 48,945 B / 128 kbps | 122,319 B / 320 kbps |
+| `.aus-tmp-*` 殘留 | — | 無 |
+
+dry run 亦確認 plan 只有 1 項且正是 `Convert-Me.mp3`。回歸：引擎 `230/230`、外殼 `66/66`、
+`npm run typecheck` 與 web 的 `tsc --noEmit`／`vite build` 全綠。

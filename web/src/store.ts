@@ -80,7 +80,13 @@ export interface UiError {
 export const ERROR_LIST_LIMIT = 8;
 
 export interface AppState {
-  tab: 'editor' | 'effects' | 'batch';
+  /**
+   * The app now has ONE page (the USB convert/normalise screen), so `usb` is the
+   * only tab the shell ever selects. The former editor/effects/batch members stay
+   * in the union because `OnboardingPanel` still dispatches `'editor'`; they are
+   * unreachable from the nav.
+   */
+  tab: 'usb' | 'editor' | 'effects' | 'batch';
   timeline: Timeline;
   /** Snapshot stack; `cursor` indexes the current entry. */
   history: HistoryEntry[];
@@ -137,7 +143,7 @@ function commit(state: AppState, label: string, next: Timeline): AppState {
 export function initialState(): AppState {
   const timeline = emptyTimeline(44100, 2);
   return {
-    tab: 'editor',
+    tab: 'usb',
     timeline,
     history: [{ label: '初始', timeline }],
     cursor: 0,

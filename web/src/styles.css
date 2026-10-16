@@ -205,3 +205,129 @@ tr.skipped td.status { color: var(--warn); }
   padding: 22px 28px; text-align: center; max-width: 520px;
 }
 .drop-overlay-title { font-size: 20px; font-weight: 600; margin-bottom: 6px; }
+
+/* --- USB page (the app's only screen) ------------------------------ */
+/* New rules only: nothing above is restyled, the shared classes
+   (.panel/.pill/.hint/.progress/.big-btn.dropzone/.spinner) are reused as-is. */
+
+.usb-page { padding-bottom: 24px; }
+
+/* Target-format picker: three radio cards. The selected one is outlined, so the
+   lossy/lossless tag next to each label stays readable in both states. */
+.usb-formats { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; }
+.usb-format {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: #161a20; font-size: 12px;
+}
+.usb-format:hover { border-color: var(--accent); }
+.usb-format-on { border-color: var(--accent); background: #1d2634; }
+.usb-format input { margin: 0; }
+.usb-format-label { font-weight: 600; }
+.usb-format-tag {
+  padding: 0 5px; border-radius: 8px; font-size: 11px;
+  background: #3a2f1e; color: #ffd9a1; border: 1px solid #6b5426;
+}
+.usb-format-tag-safe { background: #1e3226; color: #b6e8c6; border-color: #2f5c40; }
+
+/* Row of actions: buttons + the drop target, wrapping on a narrow window. */
+.usb-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.usb-actions { margin-bottom: 4px; }
+
+.usb-drop {
+  display: inline-flex; flex-direction: column; gap: 2px; align-items: flex-start;
+  padding: 8px 12px; border-radius: 6px; cursor: pointer; max-width: 420px;
+}
+.usb-drop.armed { border-color: var(--accent); border-style: solid; background: #24344a; }
+
+/* Read-only summary of the fixed target settings. */
+.usb-specs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+
+.usb-root { word-break: break-all; }
+
+/* Important, but not an error: the engine is down, or a lossless file is at risk. */
+.usb-warnline {
+  margin: 8px 0 0; padding: 7px 10px; font-size: 12px; line-height: 1.55;
+  background: #3a2f1e; color: #ffd9a1; border: 1px solid #6b5426; border-radius: 6px;
+}
+/* Neutral aside: measured against the warn colour on purpose, it is information. */
+.usb-note { margin: 8px 0 0; font-size: 12px; line-height: 1.55; color: var(--muted); }
+.usb-error {
+  margin: 8px 0 0; padding: 7px 10px; font-size: 12px;
+  background: #3a1f1e; color: #ffc9c4; border: 1px solid #6b3230; border-radius: 6px;
+}
+
+.usb-measure-note { font-weight: 400; text-transform: none; letter-spacing: 0; }
+
+/* The table is the page: it scrolls, and it stays usable while loudness
+   measurements are still arriving row by row. */
+.usb-tablewrap {
+  max-height: 58vh; overflow: auto;
+  border: 1px solid var(--line); border-radius: 6px; background: #12141a;
+}
+.usb-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usb-table thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--panel-2); color: var(--muted);
+  text-align: left; font-weight: 600; white-space: nowrap;
+  padding: 6px 8px; border-bottom: 1px solid var(--line);
+}
+.usb-table td {
+  padding: 5px 8px; border-bottom: 1px solid #22262d; vertical-align: top;
+}
+.usb-table tbody tr:hover { background: #1a1e25; }
+.usb-table .usb-check { width: 30px; text-align: center; padding-left: 6px; padding-right: 0; }
+.usb-name { word-break: break-all; }
+.usb-folder { word-break: break-all; }
+.usb-table .status { white-space: nowrap; }
+
+/* Per-row verdict colours, painted on <tr>. */
+.usb-table tr.usb-done .status { color: var(--ok); }
+.usb-table tr.usb-failed .status { color: var(--err); }
+.usb-table tr.usb-warn .status { color: var(--warn); }
+
+/* --- Folder groups inside the table --------------------------------- */
+/* The listing is grouped by folder: one heading row per folder, with its own
+   tri-state tick-box and a collapse toggle. Rows inside a folder are unchanged. */
+.usb-table tr.usb-group td {
+  position: sticky; top: 32px; z-index: 0;
+  padding: 4px 8px; background: var(--panel-2);
+  border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+}
+.usb-table tr.usb-group:hover td { background: var(--panel-2); }
+.usb-group-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.usb-group-check { margin: 0; }
+.usb-group-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 2px 6px; background: none; border: 0; cursor: pointer;
+  color: var(--text); font: inherit; font-weight: 600;
+}
+.usb-group-toggle:hover { color: var(--accent); }
+.usb-group-label { font-weight: 600; word-break: break-all; text-align: left; }
+.usb-group-count { margin-left: auto; }
+
+/* --- 「複製資料夾路徑」 --------------------------------------------- */
+.usb-copy { display: inline-flex; align-items: center; gap: 6px; margin-left: 8px; }
+.usb-copy-btn {
+  padding: 1px 6px; font-size: 11px; line-height: 1.6;
+  border: 1px solid var(--line); border-radius: 10px;
+  background: #161a20; color: var(--muted); cursor: pointer;
+}
+.usb-copy-btn:hover { border-color: var(--accent); color: var(--text); }
+/* Clipboard unavailable: the path itself is the fallback, selectable by hand. */
+.usb-copy-fallback {
+  padding: 1px 6px; border-radius: 6px; user-select: text;
+  background: #3a1f1e; color: #ffc9c4; border: 1px solid #6b3230;
+  word-break: break-all; white-space: normal;
+}
+
+.usb-measuring { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+
+/* Files the engine could not read are still worth showing. */
+.usb-scanerrs {
+  margin: 10px 0 0; padding: 8px 10px 8px 26px; max-height: 180px; overflow: auto;
+  font-size: 12px; line-height: 1.5;
+  background: #2a1f1f; border: 1px solid #4d2f2d; border-radius: 6px;
+}
+.usb-scanerrs li { margin-bottom: 6px; word-break: break-all; }
+.usb-scanerrs li:last-child { margin-bottom: 0; }

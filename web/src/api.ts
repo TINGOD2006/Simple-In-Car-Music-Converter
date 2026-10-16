@@ -15,6 +15,7 @@ import type {
   HealthResponse,
   JobEnvelope,
   JobStatusResponse,
+  MeasureResponse,
   MediaInfo,
   PickRequest,
   PickResponse,
@@ -26,6 +27,8 @@ import type {
   UploadResponse,
   WaveformResponse,
 } from './api-types.ts';
+
+import { bridgePick, detectNativeTransport, type NativeTransport } from './native-bridge.ts';
 
 export class ApiError extends Error {
   readonly status: number;
@@ -88,12 +91,50 @@ export function fileUrl(path: string): string {
   return `/api/file?path=${encodeURIComponent(path)}`;
 }
 
+/** Marker carried by {@link NoNativeDialogError}; the UI keys the upload fallback on it. */
+export const NO_NATIVE_DIALOG = 'no-native-dialog';
+
 /**
- * Engine answered 501 on `/api/pick`: this platform has no native dialog, so the
- * UI must degrade to browser upload instead of reporting a crash.
+ * No route can offer a native dialog.
+ *
+ * Distinct from `ApiError(501)`, which only says the engine cannot: this is also
+ * raised when a bridge exists but failed and the engine then answered 501.
+ */
+export class NoNativeDialogError extends Error {
+  readonly code = NO_NATIVE_DIALOG;
+
+  constructor(detail: string) {
+    super(`${NO_NATIVE_DIALOG}: ${detail}`);
+    this.name = 'NoNativeDialogError';
+  }
+}
+
+/**
+ * True when there is no native file dialog on any route, so the UI must degrade
+ * to a browser upload instead of reporting a crash.
  */
 export function isNoNativeDialog(err: unknown): boolean {
+  if (err instanceof NoNativeDialogError) return true;
   return err instanceof ApiError && err.status === 501;
+}
+
+/**
+ * The slice of `fetch` this module uses.
+ *
+ * Structural on purpose: a test double can then be a plain function without
+ * having to implement the whole DOM signature.
+ */
+export type FetchLike = (url: string, init?: RequestInit) => Promise<Response>;
+
+/** Injection points for `api.pick`; both default to the real environment. */
+export interface PickDeps {
+  /**
+   * The desktop shell's bridge. Omit to auto-detect; pass `null` to force the
+   * "plain browser" path.
+   */
+  transport?: NativeTransport | null;
+  fetchImpl?: FetchLike;
+  timeoutMs?: number;
 }
 
 function postInit(body: unknown): RequestInit {
@@ -104,10 +145,14 @@ function postInit(body: unknown): RequestInit {
   };
 }
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
+async function request<T>(
+  url: string,
+  init?: RequestInit,
+  fetchImpl: FetchLike = fetch,
+): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(url, init);
+    res = await fetchImpl(url, init);
   } catch (err) {
     // Network-level failure (engine not running, DNS, connection refused...).
     throw new ApiError(url, 0, `無法連線到 Node 引擎，請確認引擎已啟動。(${describe(err)})`);
@@ -138,8 +183,48 @@ export const api = {
    * native dialog; callers check `isNoNativeDialog(err)` and fall back to a
    * browser upload instead of showing a crash.
    */
-  pick(req: PickRequest): Promise<PickResponse> {
-    return request<PickResponse>('/api/pick', postInit(req));
+  /**
+   * Ask for files or a folder, using whichever route this environment offers.
+   *
+   * 1. The desktop shell's bridge, when the page runs inside it. It is the only
+   *    route that can hand back a real engine-side path.
+   * 2. `POST /api/pick` — the engine's own native dialog (a browser on Windows).
+   * 3. Neither: rejects with {@link NoNativeDialogError}, and the caller uploads.
+   *
+   * A cancellation is reported as `{ok:true, paths:[]}` on every route, so no
+   * caller needs a second shape to tell "cancelled" from "failed".
+   */
+  async pick(req: PickRequest, deps: PickDeps = {}): Promise<PickResponse> {
+    const transport = deps.transport !== undefined ? deps.transport : detectNativeTransport();
+    let bridgeFailure = '';
+
+    if (transport) {
+      try {
+        const paths = await bridgePick(transport, req.mode, {
+          title: req.title,
+          multiple: req.multiple,
+          timeoutMs: deps.timeoutMs,
+        });
+        return { ok: true, paths: paths ?? [] };
+      } catch (err) {
+        // The shell is present but broken. That is a reason to fall back, not a
+        // reason to give up: the engine may still have a dialog of its own.
+        bridgeFailure = describe(err);
+      }
+    }
+
+    try {
+      return await request<PickResponse>('/api/pick', postInit(req), deps.fetchImpl);
+    } catch (err) {
+      if (isNoNativeDialog(err)) {
+        throw new NoNativeDialogError(
+          bridgeFailure
+            ? `the page bridge failed (${bridgeFailure}) and the engine has no dialog`
+            : 'the engine has no native dialog on this platform',
+        );
+      }
+      throw err;
+    }
   },
 
   /** `<audio src>` for a file that lives on the engine machine. */
@@ -279,6 +364,18 @@ export const api = {
 
   batch(req: BatchRequest): Promise<BatchStartResponse> {
     return request<BatchStartResponse>('/api/batch', postInit(req));
+  },
+
+  /**
+   * `GET /api/measure?path=<encodeURIComponent(path)>` — loudness of ONE file.
+   *
+   * One ffmpeg pass per call, so the caller is expected to run a few at a time and
+   * fill a table in progressively. A 404 (no such file) or a 422 (no audio stream /
+   * unreadable) arrives as an `ApiError` like every other method; the caller must
+   * render that as "unmeasurable", never as a loudness of zero.
+   */
+  measure(path: string): Promise<MeasureResponse> {
+    return request<MeasureResponse>(`/api/measure?path=${encodeURIComponent(path)}`);
   },
 
   /**

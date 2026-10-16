@@ -23,7 +23,7 @@
 'use strict';
 
 const { getAsset, getAssetKeys } = require('node:sea');
-const { existsSync, mkdirSync, readSync, rmSync, writeFileSync } = require('node:fs');
+const { existsSync, mkdirSync, readSync, rmSync, statSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { dirname, join } = require('node:path');
 const { pathToFileURL } = require('node:url');
@@ -49,44 +49,104 @@ function exeDir() {
 }
 
 /**
- * Unpack the embedded files into a temp directory and return its path.
+ * Where the embedded files may be unpacked, best first.
+ *
+ * One location is not enough. A machine can refuse to let a process create a
+ * directory in `%TEMP%` — policy, antivirus, a roaming or locked-down profile —
+ * while happily allowing one under `%LOCALAPPDATA%`, and the other way round too.
+ * With a single candidate, the first refusal killed the process and named a path
+ * the user could do nothing about. The shipped v0.2.0 build failed exactly that
+ * way: `EPERM` on `mkdir` under `%TEMP%`, five times, then exit 1.
+ */
+function extractionCandidates(stamp) {
+  const seen = new Set();
+  const candidates = [];
+  const add = (candidate) => {
+    if (!candidate) return;
+    const key = candidate.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push(candidate);
+  };
+
+  add(join(tmpdir(), `aus-app-${stamp}`));
+  if (process.env.LOCALAPPDATA) {
+    add(join(process.env.LOCALAPPDATA, 'AudioUsbStudio', 'runtime', stamp));
+  }
+  if (process.env.APPDATA) {
+    add(join(process.env.APPDATA, 'AudioUsbStudio', 'runtime', stamp));
+  }
+  // Last resort: beside the executable. Also the one spot that works when the
+  // whole user profile is read-only, at the cost of leaving files next to the app.
+  add(join(exeDir(), `.aus-runtime-${stamp}`));
+
+  return candidates;
+}
+
+/**
+ * Unpack the embedded files and return the directory they landed in.
  *
  * The directory name carries the app version and the executable's size/mtime, so
  * upgrading the exe extracts into a fresh directory instead of running a stale mix
  * of old and new modules. A `.ready` marker written last makes a half-finished
  * extraction (killed process) redo itself rather than run broken code.
+ *
+ * Every candidate is tried in turn and every refusal is collected, so a failure
+ * says which locations were tried and what each one answered — instead of naming
+ * one path and giving up.
  */
 function extractEmbedded() {
   const exe = process.execPath;
   let stamp = VERSION;
   try {
-    const st = require('node:fs').statSync(exe);
+    const st = statSync(exe);
     stamp += `-${st.size}-${Math.floor(st.mtimeMs)}`;
   } catch {
     /* fall back to the version alone */
   }
 
-  const root = join(tmpdir(), `aus-app-${stamp}`);
-  const marker = join(root, '.ready');
-  if (existsSync(marker)) return root;
+  const refusals = [];
 
-  rmSync(root, { recursive: true, force: true });
-  mkdirSync(root, { recursive: true });
-  // The embedded modules are ESM. Without this marker Node reads `.js` as CJS and
-  // every import fails with "Cannot use import statement outside a module".
-  writeFileSync(join(root, 'package.json'), '{"type":"module"}\n');
+  for (const root of extractionCandidates(stamp)) {
+    const marker = join(root, '.ready');
+    if (existsSync(marker)) return root;
 
-  for (const key of getAssetKeys()) {
-    // Asset keys are relative virtual paths. An earlier build prefixed them with
-    // `file:`; accept both spellings so a blob built either way still extracts.
-    const rel = key.startsWith('file:') ? key.slice('file:'.length) : key;
-    const dest = join(root, rel);
-    mkdirSync(dirname(dest), { recursive: true });
-    writeFileSync(dest, Buffer.from(getAsset(key)));
+    try {
+      // A leftover from a killed run may hold files this process cannot replace.
+      rmSync(root, { recursive: true, force: true });
+      mkdirSync(root, { recursive: true });
+      // The embedded modules are ESM. Without this marker Node reads `.js` as CJS
+      // and every import fails with "Cannot use import statement outside a module".
+      writeFileSync(join(root, 'package.json'), '{"type":"module"}\n');
+
+      for (const key of getAssetKeys()) {
+        // Asset keys are relative virtual paths. An earlier build prefixed them
+        // with `file:`; accept both spellings so a blob built either way still
+        // extracts.
+        const rel = key.startsWith('file:') ? key.slice('file:'.length) : key;
+        const dest = join(root, rel);
+        mkdirSync(dirname(dest), { recursive: true });
+        writeFileSync(dest, Buffer.from(getAsset(key)));
+      }
+
+      writeFileSync(marker, `${new Date().toISOString()}\n`);
+      return root;
+    } catch (err) {
+      const code = err && err.code ? err.code : 'ERROR';
+      const message = err && err.message ? err.message : String(err);
+      refusals.push(`${root}\n        ${code}: ${message}`);
+    }
   }
 
-  writeFileSync(marker, `${new Date().toISOString()}\n`);
-  return root;
+  throw new Error(
+    [
+      `could not unpack the application: all ${refusals.length} location(s) refused.`,
+      ...refusals,
+      'If every location was refused with EPERM/EACCES, Windows policy or antivirus is',
+      'blocking this program from creating its working directory. Extracting the release',
+      'somewhere you own (not under Program Files or a synced folder) is the usual fix.',
+    ].join('\n'),
+  );
 }
 
 function usage() {

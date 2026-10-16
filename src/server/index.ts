@@ -16,13 +16,16 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { extname, isAbsolute, join, normalize, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { preferredScratchPath, tryResolveScratchRoot } from '../core/approot.ts';
 import { findBinaries } from '../core/ffbin.ts';
 import type { BinPaths } from '../core/ffbin.ts';
 import { probe } from '../core/probe.ts';
+import { measureFileLoudness } from '../core/loudness.ts';
+import { usbPreset } from '../core/edl.ts';
 import { render, verify } from '../core/render.ts';
 import { compile } from '../core/compiler.ts';
 import type { ExportPreset, Timeline } from '../core/types.ts';
+import { sweepStaleStaging } from '../core/staging.ts';
 import { getJob, listJobs, startJob } from './jobs.ts';
 import { waveform } from './waveform.ts';
 import {
@@ -96,6 +99,52 @@ function sendText(res: ServerResponse, status: number, text: string): void {
   res.end(text);
 }
 
+/** What a pre-run staging sweep found and did. */
+export interface StagingSweep {
+  /** Absolute paths of the leftover staging files that were actually removed. */
+  removed: string[];
+  /** The one line to show the user, or null when nothing was removed. */
+  notice: string | null;
+}
+
+/**
+ * Reclaim `.aus-tmp-` leftovers under the directories a batch is about to touch.
+ *
+ * A run that dies between "rendered" and "renamed" leaves its staging file behind
+ * forever; the scanner skips such a name (see core/library.ts), but the file still
+ * eats space on the stick, and its existence is how a user ends up with a `(2)`
+ * duplicate. Both entry points — `/api/batch` and the CLI's `batch` — therefore
+ * clean up before they start, through this one function so the two can never
+ * disagree about *when* or *where*.
+ *
+ * What counts as stale is decided in core/staging.ts (mtime window + "cannot open
+ * it for write, keep it") and is deliberately not re-implemented here.
+ *
+ * Scope is exactly the roots of this run: no parent directory, no drive-wide walk.
+ * `notice` is null when nothing was removed, because "cleaned 0 files" on every
+ * run is noise the user learns to ignore.
+ *
+ * Never throws: a cleanup that cannot run (an unreadable or malformed root) must
+ * not take the batch down with it — the scan reports a genuinely bad root itself.
+ */
+export function sweepStaleStagingUnder(roots: string[]): StagingSweep {
+  try {
+    const dirs = [
+      ...new Set(roots.filter((r) => typeof r === 'string' && r !== '').map((r) => resolve(r))),
+    ];
+    const removed = dirs.length === 0 ? [] : sweepStaleStaging(dirs).removed;
+    return { removed, notice: stagingSweepNotice(removed.length) };
+  } catch {
+    return { removed: [], notice: null };
+  }
+}
+
+/** The line shown after a sweep, or null when there is nothing worth saying. */
+export function stagingSweepNotice(removedCount: number): string | null {
+  if (removedCount <= 0) return null;
+  return `已清除 ${removedCount} 個上次留下的暫存檔`;
+}
+
 function readBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolvePromise, reject) => {
     const chunks: Buffer[] = [];
@@ -165,11 +214,34 @@ function serveStatic(root: string, urlPath: string, res: ServerResponse): boolea
   return true;
 }
 
+/**
+ * Loudness target handed to the analysis filter.
+ *
+ * Read from the USB preset so the table and the render cannot disagree about
+ * what "aligned to the standard" means. These values only parameterise the
+ * filter: what comes back are the *input* measurements, which do not depend on
+ * them, so a wrong target cannot make a file look louder or quieter than it is.
+ */
+function measureTargets(): { integratedLufs: number; truePeakDb: number; lra: number } {
+  const loudness = usbPreset().loudness;
+  return {
+    integratedLufs: loudness?.integratedLufs ?? -14,
+    truePeakDb: loudness?.truePeakDb ?? -1,
+    lra: loudness?.lra ?? 11,
+  };
+}
+
 function makeHandler(opts: ServerOptions, bins: BinPaths) {
-  const scratchRoot = opts.scratchRoot ?? join(tmpdir(), 'aus-server');
   // ffmpeg/ffprobe run with `cwd: scratchRoot`; a missing cwd makes spawn fail
   // with a misleading ENOENT naming the *binary* rather than the directory.
-  mkdirSync(scratchRoot, { recursive: true });
+  //
+  // Nowhere writable is deliberately *not* fatal. The window has to come up and the
+  // UI has to load even then, because the machine's own refusal is exactly what the
+  // user needs to be told about — an engine that dies while setting up reports
+  // nothing at all, which is the failure this whole path exists to end.
+  const { root, refusals } = tryResolveScratchRoot(opts.scratchRoot);
+  const scratchRoot = root ?? opts.scratchRoot ?? preferredScratchPath();
+  const scratchRefusals = refusals;
   const webRoot = opts.webRoot;
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -187,8 +259,47 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
           ffprobe: bins.ffprobe,
           ffmpegSource: bins.source,
           scratchRoot,
+          scratchWritable: root !== null,
+          scratchRefusals,
           node: process.version,
         });
+        return;
+      }
+
+      /* ---------------------------------------------------------------- */
+      /* Measure one file's loudness                                       */
+      /* ---------------------------------------------------------------- */
+      // The library table shows one loudness per row, so this is called once per
+      // file, in the background, while the list is already on screen.
+      if (path === '/api/measure' && req.method === 'GET') {
+        const target = url.searchParams.get('path');
+        if (!target) {
+          send(res, 400, { ok: false, error: 'path is required' });
+          return;
+        }
+        if (!existsSync(target)) {
+          send(res, 404, { ok: false, error: `no such file: ${target}` });
+          return;
+        }
+        try {
+          const measured = await measureFileLoudness(
+            bins.ffmpeg,
+            target,
+            scratchRoot,
+            measureTargets(),
+          );
+          send(res, 200, {
+            ok: true,
+            path: target,
+            lufs: measured.inputI,
+            truePeakDb: measured.inputTp,
+            lra: measured.inputLra,
+          });
+        } catch (err) {
+          // 422, not 500: the file is the problem, not the server. Reporting a
+          // loudness of zero here would make an unreadable row look like silence.
+          send(res, 422, { ok: false, error: (err as Error).message });
+        }
         return;
       }
 
@@ -455,6 +566,33 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
           send(res, 400, { ok: false, error: 'outputDir is required' });
           return;
         }
+        // `outputDir` stays required in overwrite mode as well. Accepting a request
+        // that says "replace the originals" while dropping where it would otherwise
+        // have written makes the two modes too easy to confuse for each other.
+        if (opts.overwrite !== undefined && typeof opts.overwrite !== 'boolean') {
+          send(res, 400, { ok: false, error: 'overwrite must be a boolean' });
+          return;
+        }
+        // `preserveNames` decides whether an in-place run keeps each source's own file
+        // name (the default) or is re-organised by the tag pattern. A non-boolean is a
+        // client bug, and coercing it would silently rename a library the user asked to
+        // leave alone.
+        if (opts.preserveNames !== undefined && typeof opts.preserveNames !== 'boolean') {
+          send(res, 400, { ok: false, error: 'preserveNames must be a boolean' });
+          return;
+        }
+        // The caller's tick-boxes are only real if the engine honours them. An empty
+        // array is legitimate and means "convert nothing"; a malformed one is not,
+        // because ignoring it would convert exactly the files the user unticked.
+        if (opts.includePaths !== undefined) {
+          if (
+            !Array.isArray(opts.includePaths) ||
+            opts.includePaths.some((p) => typeof p !== 'string')
+          ) {
+            send(res, 400, { ok: false, error: 'includePaths must be an array of strings' });
+            return;
+          }
+        }
         if (!opts.preset || typeof opts.preset !== 'object') {
           send(res, 400, { ok: false, error: 'preset is required' });
           return;
@@ -510,6 +648,12 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
         }
 
         const job = startJob(async (report) => {
+          // Reclaim leftovers from a previous crashed run *here*, inside the real
+          // run: the dry-run branch above has already returned, so a dry run cannot
+          // reach this line and cannot delete anything. The roots are this run's
+          // own, never the drive.
+          const sweep = sweepStaleStagingUnder(roots);
+          if (sweep.notice) report({ stage: sweep.notice, done: 0, total: 0 });
           const result = await mod.runBatch({
             ...opts,
             onProgress: (p: unknown) => {
@@ -525,7 +669,10 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
           if (typeof body.manifestPath === 'string' && body.manifestPath) {
             mod.writeManifest(result, body.manifestPath);
           }
-          return result;
+          // Carried out with the report so the count is still readable once the job
+          // has finished — the progress line above is overwritten by the first
+          // render stage within milliseconds.
+          return { ...(result as Record<string, unknown>), stagingSweep: sweep };
         });
 
         send(res, 202, { ok: true, jobId: job.id });

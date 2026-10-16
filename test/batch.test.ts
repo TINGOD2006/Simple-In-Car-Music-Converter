@@ -33,6 +33,8 @@ import {
   defaultConcurrency,
   effectivePreset,
   estimateOutputBytes,
+  inPlaceName,
+  inPlaceTargetProblem,
   manifestJson,
   mapPool,
   planBatch,
@@ -217,9 +219,13 @@ test('batch: containerExtension and estimateOutputBytes match the preset', () =>
   assert(estimateOutputBytes(flac, 10) < estimateOutputBytes(wav, 10), 'FLAC estimate is below PCM');
 });
 
-test('batch: defaultConcurrency leaves at least one core free', () => {
+test('batch: defaultConcurrency stays inside what one storage device can serve', () => {
   const n = defaultConcurrency();
   assert(Number.isInteger(n) && n >= 1, `concurrency is a positive integer (got ${n})`);
+  // This tool renders many small files onto one USB stick. That is bounded by the
+  // device, not by the CPU: the old `cpus - 1` default opened 15 concurrent
+  // writers against a single FAT32 stick and the device served about 1 MiB/s.
+  assert(n <= 4, `does not stampede one device with writers (got ${n})`);
 });
 
 test('batch: mapPool runs every item, preserves order and respects the limit', async () => {
@@ -748,3 +754,497 @@ function readdirSafe(dir: string): string[] {
     return [];
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Overwrite mode: convert a USB in place                              */
+/* ------------------------------------------------------------------ */
+
+/** Anything that looks like the staging file overwrite mode renders through. */
+function stagingLeftovers(dir: string): string[] {
+  return readdirSafe(dir).filter((f) => f.includes('.aus-tmp'));
+}
+
+test('INTEGRATION: overwrite converts each file in place and deletes the original', async () => {
+  if (skipUnlessAvailable()) return;
+
+  const music = scratch('overwrite-music');
+  const unusedOut = scratch('overwrite-unused');
+  try {
+    const src = await makeTone(music, 'song.wav', { freq: 440, dur: 4 });
+
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-work'),
+      roots: [music],
+      outputDir: unusedOut,
+      preset: usbPreset(),
+      overwrite: true,
+      concurrency: 1,
+    });
+
+    assertEq(report.items.length, 1, 'one source file, one row');
+    assertEq(
+      report.items[0]!.status,
+      'ok',
+      `the row must succeed: ${report.items[0]!.message ?? '(no message)'}`,
+    );
+
+    // The conversion lands where the source was, under the preset's extension.
+    const produced = join(music, 'song.mp3');
+    assert(!existsSync(src), 'the .wav must be gone once its MP3 replacement is in place');
+    assert(existsSync(produced), 'the converted file must sit in the source folder');
+
+    // It is a real conversion, not an empty placeholder.
+    const info = await probe(bins!.ffprobe, produced, scratch('overwrite-probe'));
+    assert(info.audio !== null, 'the produced file has an audio stream');
+    assert(info.format.durationSec > 3, `the duration must survive, got ${info.format.durationSec}`);
+
+    // outputDir plays no part in overwrite mode.
+    assertEq(readdirSafe(unusedOut).length, 0, 'overwrite must not also write to outputDir');
+
+    // And nothing was left mid-flight.
+    assertEq(stagingLeftovers(music).length, 0, 'no staging file may survive a successful run');
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+    rmSync(unusedOut, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: overwrite reports the replaced path, not a staging path', async () => {
+  if (skipUnlessAvailable()) return;
+
+  const music = scratch('overwrite-path');
+  try {
+    await makeTone(music, 'track.wav', { freq: 440, dur: 3 });
+    const produced = join(music, 'track.mp3');
+
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-path-work'),
+      roots: [music],
+      outputDir: scratch('overwrite-path-unused'),
+      preset: usbPreset(),
+      overwrite: true,
+      concurrency: 1,
+    });
+
+    // The manifest the user may keep has to name files that exist afterwards.
+    assertEq(report.items[0]!.outputPath, produced, 'the report names the file that now exists');
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: overwrite leaves an unreadable source byte-identical', async () => {
+  if (skipUnlessAvailable()) return;
+
+  const music = scratch('overwrite-broken');
+  try {
+    const broken = join(music, 'broken.wav');
+    const original = Buffer.from('these are not audio bytes, and they must survive');
+    writeFileSync(broken, original);
+
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-broken-work'),
+      roots: [music],
+      outputDir: scratch('overwrite-broken-unused'),
+      preset: usbPreset(),
+      overwrite: true,
+      concurrency: 1,
+    });
+
+    assertEq(report.items[0]!.status, 'failed', 'an unreadable source is reported, not converted');
+    assert(
+      readFileSync(broken).equals(original),
+      'the original bytes must be untouched when nothing could be produced',
+    );
+    assertEq(stagingLeftovers(music).length, 0, 'a failed run must not leave a staging file behind');
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: planBatch converts only the paths the caller selected', async () => {
+  if (skipUnlessAvailable()) return;
+  const dir = scratch('select');
+  try {
+    const music = join(dir, 'music');
+    const out = join(dir, 'out');
+    mkdirSync(music, { recursive: true });
+    await makeTone(music, 'keep.wav', { freq: 440, dur: 4 });
+    await makeTone(music, 'skip.wav', { freq: 880, dur: 4 });
+
+    const scan = await scanLibrary({ roots: [music], ffprobe: bins!.ffprobe, scratch: dir });
+    assertEq(scan.entries.length, 2, 'two files scanned');
+
+    const base = {
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: dir,
+      roots: [music],
+      outputDir: out,
+      preset: usbPreset(),
+    };
+    const keepPath = scan.entries.find((e) => e.path.endsWith('keep.wav'))!.path;
+
+    // This is the guarantee that makes an unticked row meaningful. Without it a UI
+    // that lets the user leave a lossless original alone would overwrite it anyway,
+    // because a scan of a folder returns every audio file in it.
+    const unfiltered = await planBatch(scan.entries, base);
+    assertEq(unfiltered.items.length, 2, 'without a selection, everything found is planned');
+
+    const selected = await planBatch(scan.entries, { ...base, includePaths: [keepPath] });
+    assertEq(selected.items.length, 1, 'with a selection, only the selected path is planned');
+    assertEq(selected.items[0]!.sourcePath, keepPath, 'and it is the one that was selected');
+
+    // Windows callers disagree about case, and a selection that silently misses is
+    // worse than no selection: it reads as "nothing to do" instead of an error.
+    const wrongCase = await planBatch(scan.entries, {
+      ...base,
+      includePaths: [keepPath.toUpperCase()],
+    });
+    assertEq(wrongCase.items.length, 1, 'the selection is matched case-insensitively');
+
+    const nothing = await planBatch(scan.entries, {
+      ...base,
+      includePaths: [join(music, 'absent.wav')],
+    });
+    assertEq(nothing.items.length, 0, 'selecting a path that was not scanned plans nothing');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Overwrite mode: the destination name, and what happens when the     */
+/* device refuses to accept it                                         */
+/* ------------------------------------------------------------------ */
+
+test('INTEGRATION: overwrite refuses a damaged destination name and leaves the original intact', async () => {
+  if (skipUnlessAvailable()) return;
+
+  // The user's stick had a damaged FAT32 directory entry occupying a track's name.
+  // `statSync` then throws a non-ENOENT error (`UNKNOWN: unknown error`, errno -4094)
+  // and the rename failed with an errno that told nobody what to do. A directory with
+  // the same name is the local stand-in for "that name is occupied by something that
+  // is not a usable file": it makes `renameSync` fail, and it is not ENOENT.
+  const music = scratch('overwrite-damaged');
+  const unusedOut = scratch('overwrite-damaged-unused');
+  try {
+    const source = await makeTone(music, 'victim.wav', { freq: 440, dur: 3 });
+    const targetName = join(music, 'victim.mp3');
+    mkdirSync(targetName);
+    const bytesBefore = readFileSync(source);
+    const mtimeBefore = statSync(source).mtimeMs;
+
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-damaged-work'),
+      roots: [music],
+      outputDir: unusedOut,
+      preset: usbPreset(),
+      overwrite: true,
+      concurrency: 1,
+    });
+
+    const row = report.items[0]!;
+    assertEq(row.status, 'failed', 'an unusable destination name must fail the row, not the file');
+    const msg = row.message ?? '';
+    assert(msg.includes('損毀'), `the message must say the name is damaged, got: ${msg}`);
+    assert(
+      msg.includes('磁碟檢查工具') && msg.includes('先在電腦上轉換'),
+      `the message must tell the user what to do about it, got: ${msg}`,
+    );
+    assert(msg.includes('victim.mp3'), `the message must name the file, got: ${msg}`);
+    // The device's own words are preserved whenever a syscall refused: on the real
+    // stick `statSync` throws `UNKNOWN: unknown error` (errno -4094) for a damaged
+    // FAT32 entry, and that text is what a bug report needs. A directory in the way is
+    // refused before anything is attempted, so it explains the obstruction instead —
+    // there is no errno to quote.
+    assert(
+      msg.includes('原始錯誤：') || msg.includes('同名的資料夾'),
+      `the message must say what was actually wrong, got: ${msg}`,
+    );
+    assertEq(row.outputPath, null, 'a failed row must not claim a path it did not produce');
+
+    // The one promise that matters: nothing about the original changed.
+    assert(existsSync(source), 'the original must still exist');
+    assert(
+      readFileSync(source).equals(bytesBefore),
+      'the original bytes must be untouched when its replacement could not be moved in',
+    );
+    assertEq(
+      statSync(source).mtimeMs,
+      mtimeBefore,
+      'the original mtime must be untouched as well (a rewrite would move it)',
+    );
+    assert(statSync(targetName).isDirectory(), 'the occupying directory must not be deleted');
+
+    // And the staged replacement is cleaned up rather than left on the stick.
+    assertEq(stagingLeftovers(music).length, 0, 'a refused replacement must not leave a staging file');
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+    rmSync(unusedOut, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: in-place overwrite keeps the original names by default', async () => {
+  if (skipUnlessAvailable()) return;
+
+  // The regression this pins: a real batch renamed 123 of 199 files to
+  // `{artist} - {title}` and two tracks that share a title became `X.mp3` and `X (2).mp3`.
+  // Converting in place must not move a file at all — not the tags' idea of its name,
+  // and certainly not a `(2)` suffix invented because two files disagree with it.
+  const music = scratch('overwrite-keepnames');
+  const unusedOut = scratch('overwrite-keepnames-unused');
+  try {
+    const first = '01 - Daft Punk - Around the World.wav';
+    const second = '02 - Daft Punk - Around the World.flac';
+    await makeTone(music, first, { freq: 440, dur: 3 });
+    await makeTone(music, second, { freq: 880, dur: 3 });
+
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-keepnames-work'),
+      roots: [music],
+      outputDir: unusedOut,
+      preset: usbPreset(),
+      overwrite: true,
+      // An explicit pattern must be ignored while the names are preserved: the point
+      // of the default is that the user's own file names survive untouched.
+      filenamePattern: '{artist} - {title}',
+      concurrency: 1,
+    });
+
+    assertEq(report.items.length, 2, 'two sources, two rows');
+    for (const row of report.items) {
+      assertEq(
+        row.status,
+        'ok',
+        `both conversions must succeed: ${row.message ?? '(no message)'}`,
+      );
+    }
+    const produced = readdirSafe(music).filter((f) => f.endsWith('.mp3')).sort();
+    assertEq(
+      produced.join('|'),
+      '01 - Daft Punk - Around the World.mp3|02 - Daft Punk - Around the World.mp3',
+      'each file keeps its own name, with only the container extension following the preset',
+    );
+    assert(
+      !readdirSafe(music).some((f) => f.includes('(2)')),
+      'no (2) suffix may ever be invented by an in-place conversion',
+    );
+    assert(!existsSync(join(music, first)), 'the converted source is replaced, not duplicated');
+    assert(!existsSync(join(music, second)), 'the converted source is replaced, not duplicated');
+    assertEq(stagingLeftovers(music).length, 0, 'no staging file may survive a successful run');
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+    rmSync(unusedOut, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: preserveNames:false still re-organises in-place by the tag pattern', async () => {
+  if (skipUnlessAvailable()) return;
+
+  const music = scratch('overwrite-rename');
+  const unusedOut = scratch('overwrite-rename-unused');
+  try {
+    const source = await makeTone(music, '01 - Daft Punk - Around the World.wav', {
+      freq: 440,
+      dur: 3,
+    });
+
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-rename-work'),
+      roots: [music],
+      outputDir: unusedOut,
+      preset: usbPreset(),
+      overwrite: true,
+      preserveNames: false,
+      concurrency: 1,
+    });
+
+    const row = report.items[0]!;
+    assertEq(row.status, 'ok', `the row must succeed: ${row.message ?? '(no message)'}`);
+    assertEq(
+      row.outputPath,
+      join(music, 'Daft Punk - Around the World.mp3'),
+      'an explicit false restores tag-based naming',
+    );
+    assert(existsSync(join(music, 'Daft Punk - Around the World.mp3')), 'the renamed file exists');
+    assert(!existsSync(source), 'the source moved to its new name');
+    assertEq(stagingLeftovers(music).length, 0, 'no staging file may survive a successful run');
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+    rmSync(unusedOut, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: in-place naming keeps a source name that already has the preset extension', async () => {
+  if (skipUnlessAvailable()) return;
+
+  // "Preserve the name" has to mean the bytes of the name, not a normalisation of
+  // them: a file already called `TRACK.MP3` must come out as `TRACK.MP3`, not
+  // `TRACK.mp3` and not `TRACK (2).mp3`.
+  const music = scratch('overwrite-case');
+  const unusedOut = scratch('overwrite-case-unused');
+  try {
+    await makeTone(music, 'TRACK.MP3', { freq: 440, dur: 3 });
+
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-case-work'),
+      roots: [music],
+      outputDir: unusedOut,
+      preset: usbPreset(),
+      overwrite: true,
+      concurrency: 1,
+    });
+
+    const row = report.items[0]!;
+    assertEq(row.status, 'ok', `the row must succeed: ${row.message ?? '(no message)'}`);
+    assertEq(row.outputPath, join(music, 'TRACK.MP3'), 'the name is preserved exactly');
+    // Filtered to the audio files on purpose: `makeTone` runs ffmpeg with the folder as
+    // its cwd, so its own report log is a by-product of this test's setup, not of the
+    // batch (the engine runs ffmpeg inside its scratch directory and removes it).
+    const mp3s = readdirSafe(music).filter((f) => f.toLowerCase().endsWith('.mp3'));
+    assertEq(mp3s.join('|'), 'TRACK.MP3', 'one file, under its original name');
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+    rmSync(unusedOut, { recursive: true, force: true });
+  }
+});
+
+test('INTEGRATION: an in-place conversion never claims a name another file already uses', async () => {
+  if (skipUnlessAvailable()) return;
+
+  // With names preserved, `song.flac` and an existing `song.mp3` in the same folder
+  // both want `song.mp3`. Renaming over it would destroy a file that was never part of
+  // this batch, and the flac would be deleted afterwards as a "replaced" source. That
+  // is silent data loss, so the collision is refused and the row is skipped visibly.
+  const music = scratch('overwrite-clash');
+  const unusedOut = scratch('overwrite-clash-unused');
+  try {
+    const existing = await makeTone(music, 'song.mp3', { freq: 440, dur: 2 });
+    const loser = await makeTone(music, 'song.flac', { freq: 880, dur: 2 });
+    const existingBytes = readFileSync(existing);
+
+    // Only the .flac is selected, so the .mp3 is not part of this batch: whatever
+    // happens to the .flac, the .mp3 must come out of the run untouched.
+    const report = await runBatch({
+      ffmpeg: bins!.ffmpeg,
+      ffprobe: bins!.ffprobe,
+      scratch: scratch('overwrite-clash-work'),
+      roots: [music],
+      outputDir: unusedOut,
+      preset: usbPreset(),
+      overwrite: true,
+      includePaths: [loser],
+      concurrency: 1,
+    });
+
+    const row = report.items[0]!;
+    assertEq(row.status, 'skipped', 'the track that would clobber a file is skipped, not converted');
+    assert(
+      (row.message ?? '').includes('target name is taken by an existing file'),
+      `the skip must say why, got: ${row.message ?? '(no message)'}`,
+    );
+    assert(existsSync(loser), 'the skipped source must survive untouched');
+    assert(
+      readFileSync(existing).equals(existingBytes),
+      'a file outside the batch must not be replaced by a track that merely wants its name',
+    );
+    assertEq(stagingLeftovers(music).length, 0, 'a skipped row renders nothing at all');
+
+    // Two tracks in one batch can also collide on a name that does not exist yet:
+    // `song.wav` and `song.flac` both convert to `song.mp3`. Exactly one may take it,
+    // and the other must be skipped visibly rather than convert over the first.
+    const pair = scratch('overwrite-clash-pair');
+    try {
+      await makeTone(pair, 'song.flac', { freq: 440, dur: 2 });
+      await makeTone(pair, 'song.wav', { freq: 880, dur: 2 });
+      const scan = await scanLibrary({ roots: [pair], ffprobe: bins!.ffprobe, scratch: pair });
+      assertEq(scan.entries.length, 2, 'both sources scanned');
+      const plan = await planBatch(scan.entries, {
+        ffmpeg: bins!.ffmpeg,
+        ffprobe: bins!.ffprobe,
+        scratch: pair,
+        roots: [pair],
+        outputDir: scratch('overwrite-clash-pair-out'),
+        preset: usbPreset(),
+        overwrite: true,
+      });
+      const planned = plan.items.filter((i) => i.skipped === undefined);
+      const claimed = plan.items.filter((i) => (i.skipped ?? '').includes('already claimed'));
+      assertEq(planned.length, 1, 'one target, one track: exactly one may take the name');
+      assertEq(claimed.length, 1, 'the other is skipped, visibly, instead of overwriting it');
+      assertEq(planned[0]!.outputPath, join(pair, 'song.mp3'), 'the winner writes the contested name');
+      assertEq(
+        readdirSafe(pair).filter((f) => f.endsWith('.mp3')).length,
+        0,
+        'planning writes nothing: this is decided before any render',
+      );
+    } finally {
+      rmSync(pair, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(music, { recursive: true, force: true });
+    rmSync(unusedOut, { recursive: true, force: true });
+  }
+});
+
+test('inPlaceName and inPlaceTargetProblem: the naming rule and the non-ENOENT path', () => {
+  // Pure units, no ffmpeg: they pin the two decisions that are easy to get wrong and
+  // that the integration tests above can only reach on a real volume.
+  assertEq(
+    inPlaceName(join('m', 'song.wav'), '.mp3'),
+    'song.mp3',
+    'a container change follows the preset extension',
+  );
+  assertEq(
+    inPlaceName(join('m', 'TRACK.MP3'), '.mp3'),
+    'TRACK.MP3',
+    'an already-correct extension is kept byte for byte, casing included',
+  );
+  assertEq(
+    inPlaceName(join('m', 'no-extension'), '.mp3'),
+    'no-extension.mp3',
+    'a name with no extension simply gains one',
+  );
+
+  // A missing target is the normal case and must not be reported as damage.
+  const dir = scratch('inplace-unit');
+  try {
+    assertEq(
+      inPlaceTargetProblem(join(dir, 'absent.mp3'), join(dir, 'absent.wav')),
+      null,
+      'ENOENT means "nothing in the way", not damage',
+    );
+    assertEq(
+      inPlaceTargetProblem(join(dir, 'same.wav'), join(dir, 'same.wav')),
+      null,
+      'the file being replaced is not an obstruction',
+    );
+
+    // The only locally synthesizable non-ENOENT stat failure: a NUL byte is not a
+    // legal path. Whatever a device reports instead — the user's stick says
+    // `UNKNOWN: unknown error` — the rule is "anything that is not ENOENT".
+    const damaged = inPlaceTargetProblem('bad\0name.mp3', join(dir, 'src.wav'));
+    assert(damaged !== null, 'a non-ENOENT stat failure must be reported as a damaged name');
+    assert(
+      damaged!.includes('損毀') && damaged!.includes('原始錯誤：'),
+      `the message must be actionable and keep the original text, got: ${damaged}`,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

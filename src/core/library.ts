@@ -16,6 +16,8 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { extname, isAbsolute, join, normalize, resolve } from 'node:path';
 import { probe } from './probe.ts';
+import { defaultConcurrency, mapPool } from './pool.ts';
+import { isStagingName } from './staging.ts';
 import type { MediaInfo } from './types.ts';
 
 /**
@@ -107,6 +109,14 @@ function walk(
   }
 
   for (const d of dirents) {
+    // Skip staging files by NAME, before any extension test. `batch.ts` names its
+    // temporary `<original>.aus-tmp-<6 chars><ext>` — it keeps the target extension
+    // so ffmpeg can pick a muxer, so `extname()` alone sees `.mp3` and a leftover
+    // from a crashed run would be scanned as a track and renamed onto the real file
+    // (INCIDENT-2026-10-16, defect 2: the manufactured `(2)` duplicate). Checked
+    // before the directory test too, so a staging-named directory is not descended.
+    if (isStagingName(d.name)) continue;
+
     const full = join(dir, d.name);
     let isDir = d.isDirectory();
     let isFile = d.isFile();
@@ -157,14 +167,31 @@ export interface ScanOptions {
   extensions?: string[];
   /** Recurse into subdirectories. Defaults to true. */
   recursive?: boolean;
+  /**
+   * How many files to probe at once. Defaults to the device-safe cap in
+   * pool.ts — probing one at a time measured 0.80 s per file, which is what made
+   * a 200-file stick look like it had hung.
+   */
+  concurrency?: number;
+  /**
+   * The prober, injectable so tests can exercise the scan's concurrency and
+   * ordering without spawning hundreds of ffprobe processes.
+   */
+  probeFile?: (ffprobe: string, path: string, scratch: string) => Promise<MediaInfo>;
   onProgress?: (done: number, total: number, path: string) => void;
 }
+
+/** One file's fate, kept separate from the aggregate so ordering stays explicit. */
+type ProbeOutcome =
+  | { path: string; info: MediaInfo; error: null }
+  | { path: string; info: null; error: string };
 
 /**
  * Walk every root, probe every audio file, and return what was found.
  *
- * Files are probed sequentially and in sorted path order so that progress
- * reporting and entry ordering are reproducible run to run.
+ * Files are sorted first, then probed with bounded concurrency, then reported in
+ * that sorted order — so the listing is reproducible run to run even though the
+ * probes finish in whatever order the device lets them.
  */
 export async function scanLibrary(opts: ScanOptions): Promise<ScanResult> {
   const raw = opts.extensions ?? AUDIO_EXTENSIONS;
@@ -186,20 +213,31 @@ export async function scanLibrary(opts: ScanOptions): Promise<ScanResult> {
 
   files.sort();
 
-  const entries: LibraryEntry[] = [];
-  for (let i = 0; i < files.length; i += 1) {
-    const path = files[i]!;
+  const runProbe = opts.probeFile ?? probe;
+  const concurrency = Math.max(1, opts.concurrency ?? defaultConcurrency());
+
+  let done = 0;
+  const outcomes = await mapPool<string, ProbeOutcome>(files, concurrency, async (path) => {
     try {
-      const info = await probe(opts.ffprobe, path, opts.scratch);
-      if (!info.audio) {
-        errors.push({ path, message: 'no audio stream' });
-      } else {
-        entries.push({ id: entryId(path), path, info });
-      }
+      const info = await runProbe(opts.ffprobe, path, opts.scratch);
+      return { path, info, error: null };
     } catch (err) {
-      errors.push({ path, message: (err as Error).message });
+      return { path, info: null, error: (err as Error).message };
+    } finally {
+      done += 1;
+      opts.onProgress?.(done, files.length, path);
     }
-    opts.onProgress?.(i + 1, files.length, path);
+  });
+
+  const entries: LibraryEntry[] = [];
+  for (const outcome of outcomes) {
+    if (outcome.error !== null) {
+      errors.push({ path: outcome.path, message: outcome.error });
+    } else if (!outcome.info.audio) {
+      errors.push({ path: outcome.path, message: 'no audio stream' });
+    } else {
+      entries.push({ id: entryId(outcome.path), path: outcome.path, info: outcome.info });
+    }
   }
 
   return { entries, errors };

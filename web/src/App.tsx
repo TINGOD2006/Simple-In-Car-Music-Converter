@@ -12,10 +12,7 @@ import type { DenoiseAvailabilityResponse, LibraryEntry, MediaInfo, PickMode } f
 import { AppContext } from './app-context.ts';
 import type { AppActions, BatchStartOptions } from './app-context.ts';
 import ErrorBoundary from './components/ErrorBoundary.tsx';
-import EditorTab from './components/EditorTab.tsx';
-import EffectsTab from './components/EffectsTab.tsx';
-import BatchTab from './components/BatchTab.tsx';
-import OnboardingPanel from './components/OnboardingPanel.tsx';
+import UsbTab from './components/UsbTab.tsx';
 import { collectDroppedFiles, dropHasFiles, formatBytes, joinEnginePath } from './file-intake.ts';
 import { initialState, reducer } from './store.ts';
 
@@ -40,8 +37,13 @@ function Shell(): JSX.Element {
   const [renderBusy, setRenderBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [localFileName, setLocalFileName] = useState<string | null>(null);
-  const [localUrl, setLocalUrl] = useState<string | null>(null);
-  const [denoiseInfo, setDenoiseInfo] = useState<DenoiseAvailabilityResponse | null>(null);
+  // `setLocalFile` still creates and revokes the object URL, but the USB page
+  // renders no <audio> preview, so nothing reads the value any more — hence the
+  // hole. Removing the state outright would mean deleting the whole audition path.
+  const [, setLocalUrl] = useState<string | null>(null);
+  // Kept for the same reason: the startup `/api/denoise-availability` probe and
+  // `actions.refreshDenoise` still run, they just have no panel to report into.
+  const [, setDenoiseInfo] = useState<DenoiseAvailabilityResponse | null>(null);
   const [pickBusy, setPickBusy] = useState(false);
   const [uploadBusy, setUploadBusy] = useState(false);
   const [probeBusy, setProbeBusy] = useState(false);
@@ -648,24 +650,21 @@ function Shell(): JSX.Element {
 
   const value = useMemo(() => ({ state, dispatch, actions }), [state, actions]);
 
-  /** Nothing loaded yet: the shell shows the onboarding panel on every tab. */
-  const hasAudio = Object.keys(state.sources).length > 0 || state.timeline.clips.length > 0;
-
   return (
     <AppContext.Provider value={value}>
       <div className="app">
         <header className="topbar">
           <h1>AudioUsbStudio</h1>
           <nav className="tabs">
-            {(['editor', 'effects', 'batch'] as const).map((t) => (
-              <button
-                key={t}
-                className={state.tab === t ? 'active' : ''}
-                onClick={() => dispatch({ type: 'tab', tab: t })}
-              >
-                {t === 'editor' ? '編輯器' : t === 'effects' ? '效果面板' : '批次 USB'}
-              </button>
-            ))}
+            {/* The USB page is the app's only screen; the 編輯器／效果面板／批次 USB
+                tabs are gone. A single-entry nav is kept so the shell still has a
+                place to show which page is up. */}
+            <button
+              className={state.tab === 'usb' ? 'active' : ''}
+              onClick={() => dispatch({ type: 'tab', tab: 'usb' })}
+            >
+              USB 轉換
+            </button>
           </nav>
           <span className="spacer" />
           <span
@@ -710,15 +709,11 @@ function Shell(): JSX.Element {
         ) : null}
 
         <div className="body">
-          {!hasAudio ? <OnboardingPanel /> : null}
-
-          {state.tab === 'editor' ? (
-            <EditorTab localUrl={localUrl} />
-          ) : state.tab === 'effects' ? (
-            <EffectsTab />
-          ) : (
-            <BatchTab denoiseInfo={denoiseInfo} />
-          )}
+          {/* OnboardingPanel is deliberately gone. It existed to get audio into the
+              editor, and the USB page is now the only page: its own workspace picker
+              and drop zone do that job, while the panel's call to action switched to
+              the `editor` tab — a no-op with no editor left to switch to. */}
+          <UsbTab />
         </div>
 
         {dragActive ? (

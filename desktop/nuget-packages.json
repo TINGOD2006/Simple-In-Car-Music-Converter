@@ -1,0 +1,10 @@
+{
+  "//": "Everything desktop/build-shell.mjs pre-fetches with node's fetch, because dotnet's own HTTP stack cannot reach nuget.org here (NU1301 / SSL handshake failure).",
+  "//runtimePacks": "A self-contained publish needs the runtime packs; the SDK does not bundle them. Version must match the installed shared framework (see `dotnet --list-runtimes`).",
+  "packages": [
+    { "id": "Microsoft.Web.WebView2", "version": "1.0.3351.48" },
+    { "id": "Microsoft.NETCore.App.Runtime.win-x64", "version": "10.0.11" },
+    { "id": "Microsoft.WindowsDesktop.App.Runtime.win-x64", "version": "10.0.11" },
+    { "id": "Microsoft.AspNetCore.App.Runtime.win-x64", "version": "10.0.11" }
+  ]
+}

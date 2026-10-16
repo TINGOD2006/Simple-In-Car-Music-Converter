@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>AudioUsbStudio.Shell.Tests</AssemblyName>
+    <RootNamespace>AudioUsbStudio.Shell.Tests</RootNamespace>
+    <StartupObject>AudioUsbStudio.Shell.Tests.Program</StartupObject>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!--
+      Deliberately no xUnit/NUnit: this machine cannot reach nuget.org from the .NET HTTP
+      stack, and desktop/NuGet.config points NuGet at a local folder that only holds the
+      packages desktop/build-shell.mjs pre-fetched. A test framework's transitive graph
+      would have to be pre-fetched too. A console harness costs nothing and matches the
+      shape of the engine's own test/harness.ts.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AudioUsbStudio.Shell.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -24,10 +24,10 @@
  *    report row and the run continues.
  */
 
-import { cpus } from 'node:os';
-import { dirname, join } from 'node:path';
-import { statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, extname, join, resolve } from 'node:path';
+import { realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import type { BinPaths } from './ffbin.ts';
+import { defaultConcurrency, mapPool } from './pool.ts';
 import { findDuplicates, fingerprint } from './dedup.ts';
 import { entryId, ensureDir, scanLibrary } from './library.ts';
 import type { LibraryEntry, ScanResult } from './library.ts';
@@ -49,9 +49,41 @@ export interface BatchOptions {
   /** Directories to scan. */
   roots: string[];
   outputDir: string;
+  /**
+   * Convert each file *in place*, replacing the source.
+   *
+   * Off by default, and not a cosmetic switch: a real library is irreplaceable, so
+   * each replacement is staged beside the original, verified, and only then moved
+   * over it. `outputDir` is ignored in this mode; it stays required so switching
+   * modes cannot silently leave the non-overwrite path pointing nowhere.
+   */
+  overwrite?: boolean;
+  /**
+   * When present, only these source paths are considered.
+   *
+   * `roots` says where to look; it cannot say "convert *these* of the files you
+   * found". Without this, a UI that lets the user untick a row cannot honour it —
+   * the row would be converted anyway, which for a lossless original in overwrite
+   * mode means destroying the thing the tick was protecting.
+   */
+  includePaths?: string[];
   preset: ExportPreset;
   /** Filename pattern; one of FILENAME_PATTERNS. Defaults to '{artist} - {title}'. */
   filenamePattern?: string;
+  /**
+   * Keep the source's own file name when converting in place.
+   *
+   * The user chose this as the behaviour of overwrite mode after a real batch
+   * renamed 123 of 199 files into `{artist} - {title}` and collided into `(2)`
+   * duplicates. So `overwrite: true` alone means "convert this file, do not move it":
+   * `preserveNames` defaults to `true` there, `filenamePattern` is not applied, and no
+   * `(2)` suffix is ever invented. Passing `false` explicitly restores tag-based
+   * re-organisation.
+   *
+   * It has no effect when `overwrite` is false: exporting into another folder keeps
+   * naming its outputs from `filenamePattern`, unchanged.
+   */
+  preserveNames?: boolean;
   /**
    * Loudness target. `undefined` keeps the preset's target; `null` disables
    * normalization entirely (never a single-pass fallback).
@@ -164,6 +196,89 @@ export function containerExtension(preset: ExportPreset): string {
 
 const LOSSLESS_CONTAINERS = new Set(['wav', 'aiff', 'flac']);
 
+/* ------------------------------------------------------------------ */
+/* In-place naming and the destination name probe                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The file name an in-place conversion writes through.
+ *
+ * "Keep the original name" means the user's own name, byte for byte: a source that
+ * is already in the preset's container keeps it exactly, including its casing
+ * (`SONG.MP3` stays `SONG.MP3`), and no `{artist} - {title}` rewrite or `(2)` suffix
+ * is invented. Only when the container really changes does the extension follow the
+ * format — `song.wav` becomes `song.mp3` — because MP3 bytes inside a file still
+ * called `.wav` would be a lie about its contents.
+ */
+export function inPlaceName(sourcePath: string, presetExtension: string): string {
+  const current = extname(sourcePath);
+  if (current.toLowerCase() === presetExtension.toLowerCase()) return basename(sourcePath);
+  return basename(sourcePath, current) + presetExtension;
+}
+
+/**
+ * The one sentence a user can act on when a name on their device is unusable.
+ *
+ * The original error text is kept in the message: it is what a bug report needs, and
+ * the advice is what the person in front of the machine needs. Neither is optional.
+ */
+export const DAMAGED_TARGET_ADVICE =
+  '請用磁碟檢查工具修復這個資料夾，或先在電腦上轉換後再複製回來。';
+
+/** Message for a destination name the device will not let us write to. */
+export function damagedTargetMessage(target: string, cause: string): string {
+  return `目標檔名在這台裝置上損毀，無法寫入：${basename(target)}。${DAMAGED_TARGET_ADVICE}（${cause}）`;
+}
+
+/** Two paths that name one and the same file on disk, whatever their casing. */
+function isSameFile(a: string, b: string): boolean {
+  try {
+    // realpath resolves to the name that is actually on disk, so on a
+    // case-insensitive volume `SONG.MP3` and `song.mp3` compare equal — which the
+    // naive string comparison used to get wrong.
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Why an in-place rename must not be attempted, or `null` when it may proceed.
+ *
+ * The destination is probed *before* the rename, because afterwards the original is
+ * already gone and there is nothing left to protect. On the user's USB stick a
+ * damaged FAT32 directory entry occupies the target name: `statSync` then throws
+ * `UNKNOWN: unknown error` instead of ENOENT, and the rename fails with an errno that
+ * tells the user nothing. So anything that is not a clean ENOENT counts as an
+ * unusable name — the code is deliberately not narrowed to one errno, because the one
+ * this device reports is not the standard one and the message text is not a contract.
+ */
+export function inPlaceTargetProblem(target: string, sourcePath: string): string | null {
+  try {
+    const st = statSync(target);
+    if (st.isDirectory()) {
+      return damagedTargetMessage(target, '這個名字被一個同名的資料夾佔住');
+    }
+    if (isSameFile(target, sourcePath)) return null; // the file being replaced
+    // A regular file that is not this item's own source is somebody else's track.
+    // Renaming over it would destroy it, and deleting it afterwards would destroy
+    // the very conversion we just wrote.
+    return `目標檔名已被另一個檔案佔用：${basename(target)}。就地覆寫不會覆蓋一個不是它來源的檔案，因此這一項保持原檔不動。`;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return null; // nothing there: normal
+    return damagedTargetMessage(target, `原始錯誤：${(err as Error).message}`);
+  }
+}
+
+/** True when a regular file already sits at `path` (a directory does not count). */
+function isExistingFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Estimated output size in bytes.
  *
@@ -221,6 +336,17 @@ export async function planBatch(entries: LibraryEntry[], opts: BatchOptions): Pr
   const preset = effectivePreset(opts.preset, opts.loudness);
   const ext = containerExtension(preset);
   const pattern = opts.filenamePattern ?? '{artist} - {title}';
+  // The user's decision, not a default we inherited: converting in place keeps the
+  // original names unless the caller explicitly asks for tag-based re-organisation.
+  const preserveNames = opts.overwrite === true && opts.preserveNames !== false;
+
+  // Restrict to an explicit selection before anything else looks at the list.
+  // Paths are resolved and lower-cased because Windows callers disagree about
+  // case, and a selection that silently misses is worse than no selection at all.
+  if (opts.includePaths) {
+    const wanted = new Set(opts.includePaths.map((p) => resolve(p).toLowerCase()));
+    entries = entries.filter((e) => wanted.has(resolve(e.path).toLowerCase()));
+  }
 
   // Duplicates are resolved over *all* entries first, so a dropped duplicate never
   // consumes capacity or a render slot.
@@ -248,6 +374,8 @@ export async function planBatch(entries: LibraryEntry[], opts: BatchOptions): Pr
   const items: BatchPlanItem[] = [];
   let used = 0;
   const budget = opts.targetCapacityBytes ?? null;
+  /** In-place targets already spoken for, keyed case-insensitively. */
+  const claimedTargets = new Map<string, string>();
 
   for (const e of entries) {
     const tags = tagsById.get(e.id) ?? {};
@@ -256,7 +384,14 @@ export async function planBatch(entries: LibraryEntry[], opts: BatchOptions): Pr
     const item: BatchPlanItem = {
       id: e.id,
       sourcePath: e.path,
-      outputPath: join(opts.outputDir, base + ext),
+      // Overwriting puts the target where the source was: with the name preserved
+      // that is the file itself, and a format change lands as the preset's extension
+      // beside it rather than in a separate folder.
+      outputPath: opts.overwrite
+        ? preserveNames
+          ? join(dirname(e.path), inPlaceName(e.path, ext))
+          : join(dirname(e.path), base + ext)
+        : join(opts.outputDir, base + ext),
       tags,
       durationSec,
     };
@@ -276,6 +411,27 @@ export async function planBatch(entries: LibraryEntry[], opts: BatchOptions): Pr
         continue;
       }
       used += need;
+    }
+
+    // One target, one track. Preserved names make a collision reachable — `song.flac`
+    // and `song.mp3` in the same folder both want `song.mp3` — and the loser's rename
+    // would destroy the winner's conversion and then delete its own source. That is
+    // silent data loss, so it is refused here instead: a skipped row is visible in
+    // the report, a clobbered track is not.
+    if (opts.overwrite) {
+      const ownFile = item.outputPath === item.sourcePath;
+      if (!ownFile && isExistingFile(item.outputPath)) {
+        item.skipped = `target name is taken by an existing file (${basename(item.outputPath)})`;
+        items.push(item);
+        continue;
+      }
+      const key = resolve(item.outputPath).toLowerCase();
+      if (claimedTargets.has(key)) {
+        item.skipped = `target name is already claimed by another track in this batch (${basename(item.outputPath)})`;
+        items.push(item);
+        continue;
+      }
+      claimedTargets.set(key, item.id);
     }
 
     items.push(item);
@@ -340,6 +496,28 @@ async function runOne(
     };
   }
 
+  // In overwrite mode the target IS the source, so the render must never write
+  // there directly: a half-written file would destroy the original. Stage beside
+  // it instead — same directory, therefore same volume, which is what makes the
+  // final move an atomic replace rather than a copy that can be interrupted.
+  const finalPath = item.outputPath;
+  const stagingPath = opts.overwrite
+    ? join(
+        dirname(finalPath),
+        `${basename(finalPath, extname(finalPath))}.aus-tmp-${Math.random().toString(36).slice(2, 8)}${extname(finalPath)}`,
+      )
+    : finalPath;
+
+  /** Drop the staged file. Never touches the original, which is the whole point. */
+  const discardStaged = (): void => {
+    if (!opts.overwrite) return;
+    try {
+      rmSync(stagingPath, { force: true });
+    } catch {
+      // A leftover staging file beats a lost original.
+    }
+  };
+
   try {
     const timeline = makeTimeline(
       [
@@ -360,11 +538,12 @@ async function runOne(
       timeline,
       preset,
       sourcePaths: { src: item.sourcePath },
-      outputPath: item.outputPath,
+      outputPath: stagingPath,
       tags: tagsToMetadata(item.tags),
     });
 
     if (!result.ok) {
+      discardStaged();
       return {
         item: {
           id: item.id,
@@ -382,15 +561,76 @@ async function runOne(
     const verified = await verify({
       bins,
       scratchRoot: jobScratch,
-      file: item.outputPath,
+      file: stagingPath,
       preset,
       expectedDurationSec: durationSec,
       expectLoudness: preset.loudness.enabled,
     });
 
+    if (opts.overwrite) {
+      if (verified.problems.length > 0) {
+        // A replacement that did not pass verification is not allowed to retire a
+        // working original. The user keeps the file they already had.
+        discardStaged();
+        return {
+          item: {
+            id: item.id,
+            sourcePath: item.sourcePath,
+            outputPath: null,
+            status: 'failed',
+            message: `refusing to replace the original: ${verified.problems.join('; ')}`,
+          },
+          bytes: 0,
+        };
+      }
+
+      // Verified good. Only now does the original stop existing: the move is atomic
+      // within one volume, and a renamed-away source is removed after it, never before.
+      //
+      // The destination is probed first. A damaged name on the device makes the rename
+      // fail with an errno that says nothing to the user, and this is the last moment
+      // at which the original is still untouched and we can explain what to do.
+      const problem = inPlaceTargetProblem(finalPath, item.sourcePath);
+      if (problem !== null) {
+        discardStaged();
+        return {
+          item: {
+            id: item.id,
+            sourcePath: item.sourcePath,
+            outputPath: null,
+            status: 'failed',
+            message: problem,
+          },
+          bytes: 0,
+        };
+      }
+
+      try {
+        renameSync(stagingPath, finalPath);
+      } catch (err) {
+        // Any rename failure is reported as a name the device would not accept, with
+        // the original error text appended: the raw errno alone is not actionable.
+        discardStaged();
+        return {
+          item: {
+            id: item.id,
+            sourcePath: item.sourcePath,
+            outputPath: null,
+            status: 'failed',
+            message: damagedTargetMessage(finalPath, `原始錯誤：${(err as Error).message}`),
+          },
+          bytes: 0,
+        };
+      }
+      // Only remove the source when it is genuinely a *different* file. On a
+      // case-insensitive volume `TRACK.MP3` and `Track.mp3` are one entry, and the
+      // string comparison used to delete the conversion that had just been written.
+      if (!isSameFile(item.sourcePath, finalPath)) rmSync(item.sourcePath, { force: true });
+    }
+
     let bytes = result.sizeBytes;
     try {
-      bytes = statSync(item.outputPath).size;
+      bytes = statSync(finalPath).size;
     } catch {
       /* keep the render-reported size */
     }
@@ -399,7 +639,7 @@ async function runOne(
       item: {
         id: item.id,
         sourcePath: item.sourcePath,
-        outputPath: item.outputPath,
+        outputPath: finalPath,
         status: 'ok',
         ...(verified.problems.length > 0 ? { message: verified.problems.join('; ') } : {}),
         verify: verified,
@@ -407,6 +647,7 @@ async function runOne(
       bytes,
     };
   } catch (err) {
+    discardStaged();
     return {
       item: {
         id: item.id,
@@ -424,31 +665,12 @@ async function runOne(
 /* Concurrency                                                         */
 /* ------------------------------------------------------------------ */
 
-/** Run `fn` over every item with at most `limit` in flight. Order preserved. */
-export async function mapPool<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const size = Math.max(1, Math.min(Math.max(1, Math.floor(limit)), items.length));
-  const workers = Array.from({ length: size }, async () => {
-    for (;;) {
-      const i = next;
-      next += 1;
-      if (i >= items.length) return;
-      results[i] = await fn(items[i]!, i);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
-/** Default parallelism: leave one core for the UI and the OS. */
-export function defaultConcurrency(): number {
-  return Math.max(1, cpus().length - 1);
-}
+/*
+ * `mapPool` and `defaultConcurrency` live in pool.ts: batch.ts imports
+ * library.ts, so defining the pool here would make library.ts -> pool.ts a
+ * cycle. Re-exported so existing callers (and the tests) keep working.
+ */
+export { defaultConcurrency, mapPool };
 
 /* ------------------------------------------------------------------ */
 /* Stage 6: the report                                                  */

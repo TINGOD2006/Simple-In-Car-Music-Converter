@@ -90,6 +90,65 @@ export async function measureLoudness(
   return measured;
 }
 
+export interface FileLoudnessTargets {
+  integratedLufs: number;
+  truePeakDb: number;
+  lra: number;
+}
+
+/**
+ * Measure one file's loudness directly, without building a timeline.
+ *
+ * {@link measureLoudness} measures a *program* — a compiled timeline with trims,
+ * effects and joins. The library table has no timeline: it has hundreds of files
+ * and needs one number each, so the same loudnorm analysis runs straight on the
+ * file.
+ *
+ * `-map 0:a:0` measures the first audio stream of a video container instead of
+ * failing on the video stream, which is what a music folder full of `.mp4`
+ * usually wants.
+ *
+ * Throws when the file cannot be decoded, so a caller can mark that one row as
+ * failed rather than reporting a loudness of zero and normalising it to silence.
+ */
+export async function measureFileLoudness(
+  ffmpeg: string,
+  filePath: string,
+  scratch: string,
+  targets: FileLoudnessTargets,
+): Promise<LoudnessMeasurement> {
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-i', filePath,
+    '-map', '0:a:0',
+    '-af',
+    `loudnorm=I=${targets.integratedLufs}:TP=${targets.truePeakDb}:LRA=${targets.lra}:print_format=json`,
+    '-f', 'null',
+    '-',
+  ];
+
+  const result = await runFfmpeg(ffmpeg, args, { cwd: scratch });
+  if (result.code !== 0) {
+    throw new Error(
+      `Could not measure ${filePath} (ffmpeg exit ${result.code})` +
+        (result.report ? `\n${result.report.slice(-1200)}` : ''),
+    );
+  }
+  if (!result.report) {
+    throw new Error(`Measuring ${filePath} produced no ffmpeg report log`);
+  }
+
+  const measured = parseLoudnormReport(result.report);
+  if (!measured) {
+    throw new Error(
+      `Could not parse a loudnorm summary for ${filePath}. ` +
+        `Report tail:\n${result.report.slice(-800)}`,
+    );
+  }
+  return measured;
+}
+
 /** Re-export so callers can build a measure-only argv in tests. */
 export { compileMeasurePass, compile };
 
