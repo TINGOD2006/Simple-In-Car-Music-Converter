@@ -56,12 +56,23 @@ function lookup(tags: Record<string, string>, keys: string[]): string | undefine
   return undefined;
 }
 
-/** Extract a canonical TagSet from a probed file's container metadata. */
+/**
+ * Extract a canonical TagSet from a probed file's metadata.
+ *
+ * Tags can live in two places: the container's format block (mp3/m4a/webm) and
+ * the stream itself (ogg/Vorbis comments surface as stream tags, and ffprobe's
+ * format block stays empty for them). Merge every probed stream's tags under
+ * the format tags; the format block wins per field where both exist.
+ */
 export function readTags(info: MediaInfo): TagSet {
-  const raw = info.format.tags ?? {};
+  const merged: Record<string, string> = {};
+  for (const stream of info.streams) {
+    if (stream.tags) Object.assign(merged, stream.tags);
+  }
+  Object.assign(merged, info.format.tags ?? {});
   const out: TagSet = {};
   for (const field of Object.keys(TAG_ALIASES) as (keyof TagSet)[]) {
-    const v = lookup(raw, TAG_ALIASES[field]);
+    const v = lookup(merged, TAG_ALIASES[field]);
     if (v !== undefined) out[field] = v;
   }
   return out;

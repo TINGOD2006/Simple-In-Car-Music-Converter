@@ -22,6 +22,7 @@ interface RawStream {
   bit_rate?: string;
   duration?: string;
   codec_type?: string;
+  tags?: Record<string, string>;
 }
 
 interface RawFormat {
@@ -157,6 +158,7 @@ export async function probe(
       bitsPerRawSample: num(s.bits_per_raw_sample),
       bitRate: num(s.bit_rate),
       durationSec: num(s.duration),
+      tags: s.tags && Object.keys(s.tags).length > 0 ? s.tags : undefined,
     }));
 
   const fmt = raw.format ?? {};

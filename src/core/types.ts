@@ -18,6 +18,11 @@ export interface StreamInfo {
   bitsPerRawSample: number | null;
   bitRate: number | null;
   durationSec: number | null;
+  /**
+   * Stream-level metadata (Vorbis comments on .ogg live here, not in the
+   * container's format tags). Populated by probe(); may be absent.
+   */
+  tags?: Record<string, string>;
 }
 
 export interface FormatInfo {
