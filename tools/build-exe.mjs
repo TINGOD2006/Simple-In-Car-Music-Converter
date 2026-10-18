@@ -94,6 +94,18 @@ function main() {
   }
   if (!existsSync(buildDir)) fail('build/ is missing — run without --skip-tsc');
 
+  /* 1b. Vendor bundle: build/core/download/deps.js imports ../../vendor/download-deps.js,
+   * so the generated third-party bundle must land at build/vendor/ (tsc does not copy it). */
+  const vendorSrc = join(ROOT, 'src', 'vendor', 'download-deps.js');
+  if (existsSync(vendorSrc)) {
+    const vendorDst = join(buildDir, 'vendor', 'download-deps.js');
+    mkdirSync(dirname(vendorDst), { recursive: true });
+    cpSync(vendorSrc, vendorDst);
+    log(`      vendor bundle copied (${statSync(vendorDst).size} bytes)`);
+  } else {
+    log('      WARNING: src/vendor/download-deps.js is missing — run tools/bundle-download-vendor.mjs');
+  }
+
   /* 2. Collect assets: the engine, then the built UI. */
   log('[2/6] collecting assets');
   const assets = {};
