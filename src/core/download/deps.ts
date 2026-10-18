@@ -8,6 +8,7 @@ import {
     Spotify,
     SPDL_FORMATS,
     downloadTrackStream,
+    getYouTubeAudio,
     getYouTubeInfo,
     getYouTubeStream,
     searchYouTubeMusic,
@@ -22,6 +23,7 @@ import {
 export { SPDL_FORMATS };
 export { searchYouTubeMusic };
 export { getYouTubeStream };
+export { getYouTubeAudio };
 export { getYouTubeInfo };
 export { SpotifyApiError, SpotifyAuthError, SpotifyError, SpotifyResolveError, SpotifyStreamError };
 export { Spotify };

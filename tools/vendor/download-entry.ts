@@ -175,3 +175,21 @@ export async function getYouTubeInfo(url: string): Promise<{
         isLive: details.isLiveContent === true,
     };
 }
+
+/**
+ * Best audio-only stream plus the container it will actually land in
+ * ("webm" → .webm, "mp4" (m4a/opus-in-mp4) → .m4a). Callers write to a temp
+ * name and rename to the container-specific extension afterwards.
+ */
+export async function getYouTubeAudio(url: string): Promise<{
+    stream: import("node:stream").Readable;
+    container: ".webm" | ".m4a";
+}> {
+    const info = await (ytdlCore as any).getInfo(url);
+    const format = (ytdlCore as any).chooseFormat(info.formats, {
+        filter: "audioonly",
+        quality: "highestaudio",
+    });
+    const stream = (ytdlCore as any).downloadFromInfo(info, { format });
+    return { stream, container: format?.container === "mp4" ? ".m4a" : ".webm" };
+}

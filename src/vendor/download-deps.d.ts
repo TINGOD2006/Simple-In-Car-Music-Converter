@@ -63,6 +63,10 @@ export interface YouTubeSongRow {
 }
 export declare function searchYouTubeMusic(query: string): Promise<YouTubeSongRow[]>;
 export declare function getYouTubeStream(url: string, options?: { quality?: string }): Readable;
+export declare function getYouTubeAudio(url: string): Promise<{
+    stream: Readable;
+    container: '.webm' | '.m4a';
+}>;
 export declare function getYouTubeInfo(url: string): Promise<{
     videoId: string;
     title: string;

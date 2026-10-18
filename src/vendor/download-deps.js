@@ -91234,6 +91234,15 @@ async function getYouTubeInfo(url2) {
     isLive: details.isLiveContent === true
   };
 }
+async function getYouTubeAudio(url2) {
+  const info = await import_ytdl_core.default.getInfo(url2);
+  const format = import_ytdl_core.default.chooseFormat(info.formats, {
+    filter: "audioonly",
+    quality: "highestaudio"
+  });
+  const stream4 = import_ytdl_core.default.downloadFromInfo(info, { format });
+  return { stream: stream4, container: format?.container === "mp4" ? ".m4a" : ".webm" };
+}
 export {
   AudioType,
   Endpoints,
@@ -91247,6 +91256,7 @@ export {
   SpotifyStreamError,
   downloadTrackStream,
   getIdFromURL,
+  getYouTubeAudio,
   getYouTubeInfo,
   getYouTubeStream,
   premiumFormats,
