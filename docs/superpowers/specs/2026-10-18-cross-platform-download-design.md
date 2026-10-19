@@ -30,7 +30,12 @@ with the chosen USB preset → scan-visible in the USB tab.
 
 - Other platforms (YT Music direct, SoundCloud, …). The `DownloadProvider`
   interface is the extension point; adding a provider must not touch queue, API
-  or UI logic.
+  or UI logic. **Superseded for YouTube only** by
+  `docs/superpowers/specs/2026-10-19-youtube-source-design.md`, which also
+  records that the extension point turned out to be insufficient: adding a real
+  second platform changed `DownloadRoute`, `TrackMeta` and the vendor façade,
+  and replaced the two YouTube packages this spec pinned because live probing
+  showed neither could produce playable formats.
 - Lossless downloads from Spotify (no supported tool does this).
 - Persisting the download queue across engine restarts (same in-memory semantics
   as the batch job registry; files already on disk survive, and re-starting a
