@@ -92,6 +92,19 @@ and permanently fragile.
 | `yt-dlp --flat-playlist -J 'ytsearch1:…'` | entries carry `id`, `title`, `duration`, `uploader`, `channel`, `view_count`, `thumbnails` — and **no `artist`/`album`** |
 | Option support | `--print-to-file`, `--write-info-json`, `--dump-json`, `--flat-playlist`, `--no-simulate`, `--paths` all **SUPPORTED** |
 
+The `-J` rows above were gathered by reading stdout directly. Because the shipping
+wrapper can never read stdout (see *The yt-dlp layer*), the two channels the design
+actually depends on were re-measured in isolation, with stdout **and** stderr
+discarded:
+
+| Probe (stdout **and** stderr discarded) | Result |
+|---|---|
+| `--flat-playlist --simulate --print-to-file "<id>\t<title>\t<uploader>\t<duration>\t<thumbnails>j" <file> <album url>` | **exit 0**, file written, 8,331 bytes, **11 non-empty rows**, `%(…)j` emitting valid JSON |
+| `--flat-playlist --simulate --write-info-json -o <dir>/%(id)s.%(ext)s <album url>` | exit 0 but **0 files** — unusable as the playlist channel |
+| `--skip-download --write-info-json -o <dir>/%(id)s.%(ext)s <a good single video>` | exit 0, wrote `dQw4w9WgXcQ.info.json` (615,759 bytes) — single videos only |
+| the same on an unavailable id | **exit 1 and 0 files** — a failure leaves nothing behind to read |
+| `stderr` redirected to a **file descriptor** (not a pipe) | accepted: good → exit 0 / empty log; unavailable → exit 1 / `ERROR: [youtube] <id>: This video is unavailable`; bad option → exit 2 / usage text |
+
 ### Honest limitation on the evidence
 
 End-to-end verification used the **3 MB Python zipapp** (`python yt-dlp.zipapp
@@ -229,18 +242,28 @@ export interface RunYtDlpResult { code: number; timedOut?: boolean }
 export function runYtDlp(bin: string, args: string[], opts: RunYtDlpOptions): Promise<RunYtDlpResult>;
 ```
 
-- `spawn(bin, argv, { cwd, stdio: 'ignore', windowsHide: true })`. **Never piped.**
-  Every result is exchanged through a file: `--print-to-file` (confirmed
-  supported) or `--write-info-json`. This is the same rule `ffbin.ts:4-9` records
-  as measured fact, not preference.
+- `spawn(bin, argv, { cwd, stdio: ['ignore', 'ignore', errFd], windowsHide: true })`.
+  **Never piped.** stdout is discarded outright; stderr is redirected to a **file
+  descriptor the wrapper opens itself** — a file, not a pipe. This is the same
+  rule `ffbin.ts:4-9` records as measured fact rather than preference, and it was
+  measured again here: this sandbox accepts a file-backed `stderr` and rejects a
+  piped one.
+- **Data comes back through files, never through stdout.** `--print-to-file`
+  writes its rows with stdout and stderr both discarded (measured: exit 0, one
+  tab-separated row per playlist entry, `%(…)j` emitting valid JSON).
+  `--write-info-json` is **not** a data channel here: combined with
+  `--flat-playlist --simulate` it writes zero files (measured), and it produces a
+  file only for a single video resolved with `--skip-download`.
 - Timeout → `SIGTERM` → grace → `SIGKILL`, resolving rather than hanging, exactly
   as `runFfmpeg` does (`DEFAULT_RUN_TIMEOUT_MS`, `KILL_GRACE_MS`). A download
   timeout is much longer than a probe's, so it is a distinct exported constant.
-- **Failure reasons must come from disk**, since stderr is discarded. On a
-  non-zero exit the wrapper reads what yt-dlp left behind — with
-  `--write-info-json` enabled, a failed item leaves a `<name>.info.json.ytdl`
-  carrying the error — and maps exit codes and that file to the reason set below.
-  The exact mapping is pinned by tests against recorded fixtures.
+- **Failure reasons come from the captured stderr file plus the exit code.** The
+  wrapper reads back the stderr log it opened, and maps its text and the exit code
+  onto the reason set below. Measured exit codes: `0` success; `1` extraction or
+  download failure, stderr `ERROR: [youtube] <id>: This video is unavailable`; `2`
+  invalid invocation. The exact mapping is pinned by tests against fixtures.
+  A failed item leaves **nothing** on disk, so no reason may be derived from a
+  leftover file.
 
 Reasons, joining the existing set (`timeout`, `cancelled`, `cookie-expired`,
 `rate-limit`, `no-confident-match`, `io-error`):
@@ -278,7 +301,9 @@ because that is what pasting a *video* URL means. Channel pages, `@handle` URLs
 and search-result pages are rejected — they are not a track list.
 
 `resolveYouTubeSource(url)` runs
-`yt-dlp --flat-playlist -J --no-warnings <url>` and maps entries to `TrackMeta`:
+`yt-dlp --flat-playlist --simulate --no-warnings --print-to-file "<template>" <file> <url>`,
+where the template emits `id`, `title`, `uploader`, `duration` and `thumbnails`
+(JSON-encoded) as tab-separated columns, and maps the rows to `TrackMeta`:
 
 | `TrackMeta` field | Source |
 |---|---|
@@ -301,7 +326,7 @@ can tell the caller what they pasted.
 
   ```
   yt-dlp -f bestaudio/best --no-playlist --force-overwrites
-         --write-info-json -o "<dest>/<sanitized name>.%(ext)s" -- <videoId>
+         -o "<dest>/<sanitized name>.%(ext)s" -- <videoId>
   ```
 
   - **`--force-overwrites` is required, not cosmetic.** yt-dlp's default is
@@ -309,6 +334,12 @@ can tell the caller what they pasted.
     1 KB counts as done"*, so a leftover stub below that threshold must be
     replaced — without this flag yt-dlp silently declines and the track hangs as
     a file that never appears.
+  - **No `--write-info-json` on this path.** Metadata comes from the resolve step
+    and the tagger writes the tags, so a sidecar `.info.json` would only litter the
+    destination folder — and it cannot double as an error channel, because a failed
+    item writes nothing at all (measured; see the evidence table above). The
+    wrapper discovers the landed file by scanning for `<name>.*` beside the
+    partial.
   - yt-dlp writes `<final>.part` and renames on success (the same `.part` +
     rename discipline Route B already uses), but its partial name includes the
     extension, so cancellation must delete `<dest>/<name>.*.part`, not
@@ -323,7 +354,8 @@ can tell the caller what they pasted.
   treating "the code is untouched" as "the constant is still correct" would be
   exactly the unverified assumption this document exists to avoid.
   `searchYouTubeMusic()`
-  becomes `yt-dlp --flat-playlist -J 'ytsearch5:<query>'`, and the audio fetch
+  becomes the same `--print-to-file` invocation with `ytsearch5:<query>` as the
+  URL, and the audio fetch
   becomes `youtubeDirect`'s command. The mapping is direct:
   `id → videoId`, `uploader/channel → artistName` (used by the existing "Topic
   channel" bonus), `duration → durationSec`, `thumbnails[last] → thumbnailUrl`,
