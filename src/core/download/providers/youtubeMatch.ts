@@ -48,8 +48,19 @@ function tokens(s: string): string[] {
 
 /** `(...)`, `[...]` — qualifiers a metadata title never carries. */
 const DECORATION_RE = /[（(][^)）]*[)）]|\[[^\]]*\]/g;
-/** `ft. X`, `feat X`, `featuring X`, `with X` — the rest of the title is a guest. */
-const FEATURING_RE = /\b(?:ft|feat|featuring|with)\.?\s+.*$/i;
+/**
+ * `ft. X`, `feat X`, `featuring X` — the rest of the title is a guest.
+ *
+ * `with` is deliberately NOT in this list even though it reads like a credit.
+ * It is far more often part of the title itself ("Rock with You", "Stay with
+ * Me", "Dance with Somebody"), and because the rule truncates everything after
+ * the match, including it cut those titles down to their first word. Measured:
+ * the exact official upload of "Rock with You" scored 69.33 against a floor of
+ * 70 and was rejected as having no confident match. A genuine `with` credit
+ * therefore scores as an imperfect match instead of a wrong one — a risk the
+ * duration gate already covers.
+ */
+const FEATURING_RE = /\b(?:ft|feat|featuring)\.?\s+.*$/i;
 
 /**
  * Strip the decorations a YouTube title adds to a track title.

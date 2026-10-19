@@ -136,6 +136,9 @@ export async function resolveForApi(
 /** Four-oh-four versus upstream: what the API should answer for a resolve failure. */
 export function resolveFailureStatus(err: unknown): number {
   if (err instanceof DownloadFailure && err.reason === 'unsupported-url') return 400;
+  // An empty source is not an outage: yt-dlp exited cleanly and the link simply
+  // holds nothing downloadable, so the fix is a different link.
+  if (err instanceof DownloadFailure && err.reason === 'no-tracks') return 400;
   if (err instanceof PlaylistTooLargeError) return 400;
   if (err instanceof DownloadFailure && err.reason === 'playlist-too-large') return 400;
   return 502;

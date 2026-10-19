@@ -177,6 +177,40 @@ test('best score below CONFIDENCE_FLOOR → null (no-confident-match)', () => {
   assertEq(pickCandidate([unrelated], META), null, 'below the floor nothing is picked');
 });
 
+test('"with" inside a real title is not treated as a guest credit', () => {
+  // Measured regression: the featuring rule matched a bare `with`, so the exact
+  // official upload of a track whose own title contains the word had its title
+  // truncated to "Rock", losing 2 of 3 tokens — 69.33 against a floor of 70 —
+  // and the track was reported as having no confident match at all.
+  const meta: TrackMeta = { ...META, title: 'Rock with You', artists: 'Michael Jackson', durationSec: 220 };
+  const exact = cand({
+    videoId: 'exact',
+    title: 'Rock with You (Official Video)',
+    artistName: 'Michael Jackson',
+    durationSec: 222,
+  });
+
+  const scored = scoreCandidates([exact], meta)[0];
+  assert(scored !== undefined, 'one scored candidate');
+  assert(
+    scored.score >= CONFIDENCE_FLOOR,
+    `the exact upload must clear the floor, scored ${scored.score}`,
+  );
+  assertEq(pickCandidate([exact], meta)?.videoId, 'exact', 'the exact upload must be picked');
+});
+
+test('a genuine guest credit is still stripped', () => {
+  const meta: TrackMeta = { ...META, title: 'Despacito', artists: 'Luis Fonsi', durationSec: 281 };
+  const credited = cand({
+    videoId: 'credited',
+    title: 'Luis Fonsi - Despacito ft. Daddy Yankee',
+    artistName: 'Luis Fonsi',
+    durationSec: 281,
+  });
+
+  assertEq(pickCandidate([credited], meta)?.videoId, 'credited', 'ft. is a credit, not a mismatch');
+});
+
 test('search asks yt-dlp for a bounded ytsearch of "artists title"', async () => {
   await withScratch(async (dir) => {
     const calls: string[][] = [];

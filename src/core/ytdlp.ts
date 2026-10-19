@@ -23,7 +23,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 import { appRoot } from './approot.ts';
@@ -34,8 +34,27 @@ export const YTDLP_EXE = 'yt-dlp.exe';
 /** Overrides the search order entirely, for tests and portable installs. */
 export const YTDLP_DIR_ENV = 'AUS_YTDLP_DIR';
 
-/** Name of the per-run stderr file, inside `cwd`. */
-const REPORT_NAME = 'ytdlp-report.log';
+/**
+ * Prefix of the per-run stderr file, inside `cwd`.
+ *
+ * The name carries a process id and a counter because the file MUST NOT be
+ * shared: the queue downloads two tracks at a time and both run in the same
+ * scratch directory, so one fixed name lets a second track truncate and then
+ * overwrite the first track's log. The first track would then be told its
+ * failure was whatever the second one hit — a bogus `rate-limit` stalls the
+ * whole queue for its 30-second cooldown, and a bogus `video-unavailable`
+ * blames the wrong thing entirely. `sources/youtube.ts` and `ffbin.ts` already
+ * name their per-run files this way.
+ */
+const REPORT_PREFIX = 'ytdlp-report-';
+
+/** Per-process run counter, so two concurrent calls cannot pick one name. */
+let reportSeq = 0;
+
+function reportFileName(): string {
+  reportSeq += 1;
+  return `${REPORT_PREFIX}${process.pid}-${reportSeq}.log`;
+}
 
 /**
  * Directories next to the installed application.
@@ -149,16 +168,16 @@ export interface RunYtDlpResult {
 /**
  * Run `yt-dlp`, capturing its stderr from a file in the job scratch directory.
  *
- * Output is never piped. The report file is opened with `'w'` so it is
- * truncated per run; a stale log from an earlier call can therefore never be
- * read as this run's failure reason.
+ * Output is never piped. Each call gets its OWN report file, opened with `'w'`
+ * and removed once read: no other run can write into it, and no finished run
+ * leaves it behind.
  */
 export function runYtDlp(
   bin: string,
   args: string[],
   opts: RunYtDlpOptions,
 ): Promise<RunYtDlpResult> {
-  const reportPath = join(opts.cwd, REPORT_NAME);
+  const reportPath = join(opts.cwd, reportFileName());
   const timeoutMs = opts.timeoutMs ?? DEFAULT_YTDLP_TIMEOUT_MS;
 
   return new Promise<RunYtDlpResult>((resolve, reject) => {
@@ -211,6 +230,13 @@ export function runYtDlp(
         stderr = readFileSync(reportPath, 'utf8');
       } catch {
         stderr = '';
+      }
+      // Removed as soon as it is read: the scratch directory is long-lived and
+      // every download would otherwise leave a log behind it.
+      try {
+        rmSync(reportPath, { force: true });
+      } catch {
+        /* the report is already read; a leftover is cosmetic */
       }
       return {
         code,

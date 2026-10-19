@@ -20,6 +20,7 @@ import type { Server } from 'node:http';
 import { assert, assertEq, test } from './harness.ts';
 import { startServer } from '../src/server/index.ts';
 import { setDownloadOverridesForTests } from '../src/server/download-runtime.ts';
+import { DownloadFailure } from '../src/core/download/errors.ts';
 import { usbPreset } from '../src/core/edl.ts';
 import type {
   DownloadOpts,
@@ -164,6 +165,27 @@ test('resolve reports an upstream failure as 502, not 500', async () => {
     });
     const r = await post(base, '/api/download/resolve', { url: YT_URL });
     assertEq(r.status, 502, 'an upstream extraction failure is a bad gateway');
+  });
+});
+
+test('a link that yields no tracks is a 400, not an upstream failure', async () => {
+  await withServer(async ({ base }) => {
+    // yt-dlp exited cleanly; the playlist is simply empty or fully
+    // unavailable. Nothing upstream is broken, so the link is what is wrong.
+    setDownloadOverridesForTests({
+      resolve: async () => {
+        throw new DownloadFailure(
+          'no-tracks',
+          '這個連結沒有可下載的曲目（播放清單可能是空的，或所有曲目都無法存取）',
+        );
+      },
+    });
+    const r = await post(base, '/api/download/resolve', { url: YT_URL });
+    assertEq(r.status, 400, 'an empty source is the client link, not a bad gateway');
+    assert(
+      r.text.includes('沒有可下載的曲目'),
+      `the zh-TW explanation must reach the user, got: ${r.text}`,
+    );
   });
 });
 
