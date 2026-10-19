@@ -35,6 +35,16 @@ import {
   sendAudioFile,
   streamUpload,
 } from './files.ts';
+import { maskCookie, readDownloadSettings, writeDownloadSettings } from '../core/appsettings.ts';
+import {
+  DOWNLOAD_ROUTES,
+  downloadQueue,
+  errorMessage,
+  resolveFailureStatus,
+  resolveForApi,
+  startFromApi,
+} from './download-runtime.ts';
+import type { DownloadRoute, ResolvedSource } from '../core/download/types.ts';
 
 export interface ServerOptions {
   /** Explicit ffmpeg bin directory; otherwise auto-discovered. */
@@ -43,8 +53,17 @@ export interface ServerOptions {
   webRoot?: string;
   /** Scratch root for ffmpeg work. Defaults to a temp dir. */
   scratchRoot?: string;
+  /**
+   * Overrides where `config.json` is read and written. Tests point this at a
+   * temp directory so they never touch the user's real profile — the download
+   * settings hold the Spotify cookie.
+   */
+  settingsDirs?: string[];
   port?: number;
 }
+
+/** A stored Spotify cookie is `sp_dc=<urlsafe base64-ish>`; shape only, never verified here. */
+const SPOTIFY_COOKIE_RE = /^sp_dc=[A-Za-z0-9_%-]+$/;
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -803,6 +822,170 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
         );
         send(res, 200, result as object);
         return;
+      }
+
+      /* ---------------------------------------------------------------- */
+      /* Downloads                                                         */
+      /* ---------------------------------------------------------------- */
+      // Paste a URL → resolve it → queue the tracks → poll → the queue's own
+      // flush drops finished files straight into the destination folder, so the
+      // USB tab picks them up with no extra step.
+      //
+      // The stored Spotify cookie is the only secret in this app. It is read
+      // here, handed to the provider, and never echoed: the settings response
+      // carries `maskCookie()`'s hint (`sp_dc=****3456`) and nothing else.
+      const downloadDeps = {
+        ffmpeg: bins.ffmpeg,
+        ffprobe: bins.ffprobe,
+        scratch: scratchRoot,
+        settingsDirs: opts.settingsDirs,
+      };
+
+      if (path === '/api/download/resolve' && req.method === 'POST') {
+        const body = (await readBody(req)) as { url?: unknown };
+        const target = typeof body.url === 'string' ? body.url.trim() : '';
+        if (!target) {
+          send(res, 400, { ok: false, error: '請貼上 Spotify 或 YouTube 連結' });
+          return;
+        }
+        try {
+          const source = await resolveForApi(target, {
+            scratch: scratchRoot,
+            settingsDirs: opts.settingsDirs,
+          });
+          send(res, 200, { ok: true, source });
+        } catch (err) {
+          send(res, resolveFailureStatus(err), { ok: false, error: errorMessage(err) });
+        }
+        return;
+      }
+
+      if (path === '/api/download/start' && req.method === 'POST') {
+        const body = (await readBody(req)) as {
+          source?: ResolvedSource;
+          route?: unknown;
+          destination?: unknown;
+          preset?: ExportPreset;
+          trackIndices?: unknown;
+        };
+        const source = body.source;
+        if (!source || !Array.isArray(source.tracks) || source.tracks.length === 0) {
+          send(res, 400, { ok: false, error: '請先解析連結，取得要下載的曲目' });
+          return;
+        }
+        const destination = typeof body.destination === 'string' ? body.destination.trim() : '';
+        if (!destination) {
+          send(res, 400, { ok: false, error: '請先選擇要存放下載檔案的資料夾' });
+          return;
+        }
+        if (!body.preset) {
+          send(res, 400, { ok: false, error: '缺少輸出 preset' });
+          return;
+        }
+        const route = typeof body.route === 'string' ? body.route : '';
+        if (!DOWNLOAD_ROUTES.includes(route as DownloadRoute)) {
+          send(res, 400, { ok: false, error: `不支援的下載路線：${route}` });
+          return;
+        }
+        const trackIndices = Array.isArray(body.trackIndices)
+          ? body.trackIndices.filter((i): i is number => typeof i === 'number' && Number.isInteger(i))
+          : undefined;
+        try {
+          const downloadId = startFromApi(
+            downloadDeps,
+            source,
+            route as DownloadRoute,
+            destination,
+            body.preset,
+            trackIndices,
+          );
+          send(res, 202, { ok: true, downloadId });
+        } catch (err) {
+          send(res, 500, { ok: false, error: errorMessage(err) });
+        }
+        return;
+      }
+
+      if (path === '/api/download/status' && req.method === 'GET') {
+        const id = url.searchParams.get('downloadId') ?? '';
+        const download = downloadQueue(downloadDeps).get(id);
+        if (!download) {
+          send(res, 404, { ok: false, error: '找不到這個下載工作（可能已經重新啟動）' });
+          return;
+        }
+        send(res, 200, { ok: true, download });
+        return;
+      }
+
+      if (path === '/api/download/cancel' && req.method === 'POST') {
+        const body = (await readBody(req)) as { downloadId?: unknown; trackIndices?: unknown };
+        const id = typeof body.downloadId === 'string' ? body.downloadId : '';
+        const indices = Array.isArray(body.trackIndices)
+          ? body.trackIndices.filter((i): i is number => typeof i === 'number' && Number.isInteger(i))
+          : undefined;
+        const ok = downloadQueue(downloadDeps).cancel(id, indices);
+        send(res, ok ? 200 : 404, { ok, error: ok ? undefined : '找不到這個下載工作' });
+        return;
+      }
+
+      if (path === '/api/download/retry' && req.method === 'POST') {
+        const body = (await readBody(req)) as { downloadId?: unknown; trackIndices?: unknown };
+        const id = typeof body.downloadId === 'string' ? body.downloadId : '';
+        const indices = Array.isArray(body.trackIndices)
+          ? body.trackIndices.filter((i): i is number => typeof i === 'number' && Number.isInteger(i))
+          : [];
+        if (indices.length === 0) {
+          send(res, 400, { ok: false, error: '請指定要重試的曲目' });
+          return;
+        }
+        const ok = downloadQueue(downloadDeps).retry(id, indices);
+        send(res, ok ? 200 : 404, { ok, error: ok ? undefined : '找不到這個下載工作或曲目' });
+        return;
+      }
+
+      if (path === '/api/download/settings') {
+        if (req.method === 'GET') {
+          const settings = readDownloadSettings(opts.settingsDirs);
+          send(res, 200, {
+            ok: true,
+            spotifyCookieSet: settings.spotifyCookie !== null,
+            cookieHint: settings.spotifyCookie === null ? null : maskCookie(settings.spotifyCookie),
+            destination: settings.destination,
+          });
+          return;
+        }
+        if (req.method === 'PUT') {
+          const body = (await readBody(req)) as { spotifyCookie?: unknown; destination?: unknown };
+          const patch: { spotifyCookie?: string | null; destination?: string | null } = {};
+          if ('spotifyCookie' in body) {
+            if (body.spotifyCookie === null) {
+              patch.spotifyCookie = null;
+            } else if (
+              typeof body.spotifyCookie === 'string' &&
+              SPOTIFY_COOKIE_RE.test(body.spotifyCookie.trim())
+            ) {
+              patch.spotifyCookie = body.spotifyCookie.trim();
+            } else {
+              send(res, 400, {
+                ok: false,
+                error: 'Spotify cookie 格式不正確，應為 sp_dc=... 的形式',
+              });
+              return;
+            }
+          }
+          if ('destination' in body) {
+            if (body.destination === null) patch.destination = null;
+            else if (typeof body.destination === 'string' && body.destination.trim()) {
+              patch.destination = body.destination.trim();
+            } else {
+              send(res, 400, { ok: false, error: '資料夾路徑不正確' });
+              return;
+            }
+          }
+          writeDownloadSettings(patch, opts.settingsDirs);
+          send(res, 200, { ok: true });
+          return;
+        }
       }
 
       /* ---------------------------------------------------------------- */
