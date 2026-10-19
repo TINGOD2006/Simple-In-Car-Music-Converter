@@ -12,6 +12,13 @@ import type {
   DenoiseAvailabilityResponse,
   DenoiseRequest,
   DenoiseResponse,
+  DownloadOkResponse,
+  DownloadResolveResponse,
+  DownloadSettingsRequest,
+  DownloadSettingsResponse,
+  DownloadStartRequest,
+  DownloadStartResponse,
+  DownloadStatusResponse,
   HealthResponse,
   JobEnvelope,
   JobStatusResponse,
@@ -425,5 +432,59 @@ export const api = {
    */
   denoiseAvailability(): Promise<DenoiseAvailabilityResponse> {
     return request<DenoiseAvailabilityResponse>('/api/denoise-availability');
+  },
+
+  /* ---------------------------------------------------------------- */
+  /* Downloads                                                         */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * `POST /api/download/resolve` — turn a pasted link into a track list.
+   *
+   * A 400 means the link itself is unusable (unknown platform, an over-long
+   * playlist); a 502 means the upstream metadata service failed. The engine's
+   * message is already Traditional Chinese, so it is shown as-is.
+   */
+  resolveDownload(url: string): Promise<DownloadResolveResponse> {
+    return request<DownloadResolveResponse>('/api/download/resolve', postInit({ url }));
+  },
+
+  /** `POST /api/download/start` — 202 with the id to poll. */
+  startDownload(req: DownloadStartRequest): Promise<DownloadStartResponse> {
+    return request<DownloadStartResponse>('/api/download/start', postInit(req));
+  },
+
+  /** `GET /api/download/status?downloadId=` — one snapshot of the whole record. */
+  downloadStatus(downloadId: string): Promise<DownloadStatusResponse> {
+    return request<DownloadStatusResponse>(
+      `/api/download/status?downloadId=${encodeURIComponent(downloadId)}`,
+    );
+  },
+
+  cancelDownload(downloadId: string, trackIndices?: number[]): Promise<DownloadOkResponse> {
+    return request<DownloadOkResponse>('/api/download/cancel', postInit({ downloadId, trackIndices }));
+  },
+
+  retryDownload(downloadId: string, trackIndices: number[]): Promise<DownloadOkResponse> {
+    return request<DownloadOkResponse>('/api/download/retry', postInit({ downloadId, trackIndices }));
+  },
+
+  /**
+   * `GET /api/download/settings`.
+   *
+   * The stored Spotify cookie is never returned — only whether one exists and a
+   * masked hint (`sp_dc=****3456`). The paste-only field must stay empty.
+   */
+  getDownloadSettings(): Promise<DownloadSettingsResponse> {
+    return request<DownloadSettingsResponse>('/api/download/settings');
+  },
+
+  /** `PUT /api/download/settings` — a field left out is left unchanged. */
+  putDownloadSettings(patch: DownloadSettingsRequest): Promise<DownloadOkResponse> {
+    return request<DownloadOkResponse>('/api/download/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
   },
 };

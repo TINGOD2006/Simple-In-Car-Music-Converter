@@ -81,12 +81,12 @@ export const ERROR_LIST_LIMIT = 8;
 
 export interface AppState {
   /**
-   * The app now has ONE page (the USB convert/normalise screen), so `usb` is the
-   * only tab the shell ever selects. The former editor/effects/batch members stay
-   * in the union because `OnboardingPanel` still dispatches `'editor'`; they are
-   * unreachable from the nav.
+   * Two reachable pages: the USB convert/normalise screen and the 下載 tab that
+   * stocks it. The former editor/effects/batch members stay in the union because
+   * `OnboardingPanel` still dispatches `'editor'`; they are unreachable from the
+   * nav.
    */
-  tab: 'usb' | 'editor' | 'effects' | 'batch';
+  tab: 'usb' | 'download' | 'editor' | 'effects' | 'batch';
   timeline: Timeline;
   /** Snapshot stack; `cursor` indexes the current entry. */
   history: HistoryEntry[];

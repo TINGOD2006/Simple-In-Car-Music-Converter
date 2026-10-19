@@ -13,6 +13,7 @@ import { AppContext } from './app-context.ts';
 import type { AppActions, BatchStartOptions } from './app-context.ts';
 import ErrorBoundary from './components/ErrorBoundary.tsx';
 import UsbTab from './components/UsbTab.tsx';
+import DownloadTab from './components/DownloadTab.tsx';
 import { collectDroppedFiles, dropHasFiles, formatBytes, joinEnginePath } from './file-intake.ts';
 import { initialState, reducer } from './store.ts';
 
@@ -656,14 +657,19 @@ function Shell(): JSX.Element {
         <header className="topbar">
           <h1>AudioUsbStudio</h1>
           <nav className="tabs">
-            {/* The USB page is the app's only screen; the 編輯器／效果面板／批次 USB
-                tabs are gone. A single-entry nav is kept so the shell still has a
-                place to show which page is up. */}
+            {/* Two reachable pages: fill the stick (USB 轉換), or fetch the music to
+                fill it with (下載). The 編輯器／效果面板／批次 tabs are still gone. */}
             <button
               className={state.tab === 'usb' ? 'active' : ''}
               onClick={() => dispatch({ type: 'tab', tab: 'usb' })}
             >
               USB 轉換
+            </button>
+            <button
+              className={state.tab === 'download' ? 'active' : ''}
+              onClick={() => dispatch({ type: 'tab', tab: 'download' })}
+            >
+              下載
             </button>
           </nav>
           <span className="spacer" />
@@ -709,11 +715,9 @@ function Shell(): JSX.Element {
         ) : null}
 
         <div className="body">
-          {/* OnboardingPanel is deliberately gone. It existed to get audio into the
-              editor, and the USB page is now the only page: its own workspace picker
-              and drop zone do that job, while the panel's call to action switched to
-              the `editor` tab — a no-op with no editor left to switch to. */}
-          <UsbTab />
+          {/* Two reachable pages. The drop zone and workspace picker below belong to
+              the USB page only; the download page fetches its own sources. */}
+          {state.tab === 'download' ? <DownloadTab /> : <UsbTab />}
         </div>
 
         {dragActive ? (

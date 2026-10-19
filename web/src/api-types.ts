@@ -524,3 +524,125 @@ export interface RevealResponse {
   ok: true;
   path: string;
 }
+
+/* ------------------------------------------------------------------ */
+/* Downloads (the 下載 tab)                                            */
+/* ------------------------------------------------------------------ */
+// Mirrored from `src/core/download/types.ts` and Task 9's routes by hand, the
+// same way every other block in this file is: the page is a separate bundle and
+// cannot import `src/core`. The engine owns the truth; this file describes what
+// crosses the wire.
+
+/** `spotify-direct` needs an account; the other two shell out to yt-dlp. */
+export type DownloadRoute = 'spotify-direct' | 'youtube-match' | 'youtube-direct';
+
+/** Which platform a resolved source came from — decides the route, not the user. */
+export type DownloadPlatform = 'spotify' | 'youtube';
+
+export type TrackState =
+  | 'queued'
+  | 'downloading'
+  | 'tagging'
+  | 'converting'
+  | 'done'
+  | 'failed'
+  | 'skipped'
+  | 'cancelled';
+
+export interface DownloadTrackMeta {
+  title: string;
+  /** Joined with ', ' — also the display name and the filename stem. */
+  artists: string;
+  album: string;
+  durationSec: number;
+  /** '' when the platform gave none. YouTube sources have no embeddable cover. */
+  coverUrl: string;
+  /** The platform's own id: a Spotify track id or a YouTube video id. */
+  sourceId: string;
+}
+
+export interface DownloadResolvedSource {
+  kind: 'track' | 'album' | 'playlist' | 'video';
+  name: string;
+  platform: DownloadPlatform;
+  /** Present and true only for degraded metadata (a public oEmbed fallback). */
+  partial?: boolean;
+  tracks: DownloadTrackMeta[];
+}
+
+export interface DownloadTrackEntry {
+  index: number;
+  meta: DownloadTrackMeta;
+  state: TrackState;
+  /** Machine reason for a failed/skipped/cancelled track, for the UI copy. */
+  reason?: string;
+  rawPath?: string;
+  outputPath?: string;
+  /** Bitrate of the audio actually delivered, when it could be measured. */
+  rawKbps?: number;
+}
+
+export interface DownloadRecord {
+  id: string;
+  route: DownloadRoute;
+  destination: string;
+  sourceName: string;
+  preset: ExportPreset;
+  createdAt: string;
+  tracks: DownloadTrackEntry[];
+  finished: boolean;
+}
+
+/** `POST /api/download/resolve` 200. */
+export interface DownloadResolveResponse {
+  ok: true;
+  source: DownloadResolvedSource;
+}
+
+/** `POST /api/download/start` 202. */
+export interface DownloadStartResponse {
+  ok: true;
+  downloadId: string;
+}
+
+/** `POST /api/download/start` request. */
+export interface DownloadStartRequest {
+  source: DownloadResolvedSource;
+  route: DownloadRoute;
+  destination: string;
+  preset: ExportPreset;
+  /** Omitted means every track. */
+  trackIndices?: number[];
+}
+
+/** `GET /api/download/status?downloadId=` 200. */
+export interface DownloadStatusResponse {
+  ok: true;
+  download: DownloadRecord;
+}
+
+/** The `{ok}` body cancel/retry/settings-PUT answer with. */
+export interface DownloadOkResponse {
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * `GET /api/download/settings` 200.
+ *
+ * The cookie itself never crosses this wire in either direction: the response
+ * carries a masked `cookieHint` and a boolean, and the PUT only ever sends a new
+ * value the user just typed.
+ */
+export interface DownloadSettingsResponse {
+  ok: true;
+  spotifyCookieSet: boolean;
+  cookieHint: string | null;
+  destination: string | null;
+}
+
+/** `PUT /api/download/settings` request; a field left out is left unchanged. */
+export interface DownloadSettingsRequest {
+  spotifyCookie?: string | null;
+  destination?: string | null;
+}
