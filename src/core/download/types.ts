@@ -8,7 +8,7 @@
  * doubles and leaves the façade's internals swappable.
  */
 
-export type DownloadRoute = 'spotify-direct' | 'youtube-match';
+export type DownloadRoute = 'spotify-direct' | 'youtube-match' | 'youtube-direct';
 
 /** Which upstream service a resolved source, or a track in it, came from. */
 export type Platform = 'spotify' | 'youtube';

@@ -150,7 +150,14 @@ const FAILURE_MESSAGES: Record<YtDlpFailureReason, string> = {
   'io-error': 'yt-dlp 執行失敗',
 };
 
-function failureMessage(reason: YtDlpFailureReason, stderr: string): string {
+/**
+ * The zh-TW message for a failure reason.
+ *
+ * Exported because the download providers own failures too and must not keep a
+ * second copy of the same user-facing copy — a drifted duplicate here would
+ * reach the UI as two different explanations of one problem.
+ */
+export function ytDlpFailureMessage(reason: YtDlpFailureReason, stderr: string): string {
   const base = FAILURE_MESSAGES[reason];
   if (reason !== 'io-error') return base;
   const firstLine = stderr.split('\n').find((l) => l.trim() !== '');
@@ -191,7 +198,7 @@ export async function resolveYouTubeSource(
 
   if (result.code !== 0) {
     const reason = classifyYtDlpFailure(result.code, result.stderr);
-    throw new DownloadFailure(reason, failureMessage(reason, result.stderr));
+    throw new DownloadFailure(reason, ytDlpFailureMessage(reason, result.stderr));
   }
 
   const tracks = readRows(out);

@@ -127,7 +127,7 @@ function multiExtProvider(state: MockState): DownloadProvider {
 /** Queue deps whose tag/convert steps are stubs — no ffmpeg in unit tests. */
 function stubDeps(provider: DownloadProvider, overrides: Partial<QueueDeps> = {}): QueueDeps {
   return {
-    providers: { 'spotify-direct': provider, 'youtube-match': provider },
+    providers: { 'spotify-direct': provider, 'youtube-match': provider, 'youtube-direct': provider },
     ffmpeg: 'ffmpeg',
     ffprobe: 'ffprobe',
     scratch: '.',
@@ -395,7 +395,7 @@ test('INTEGRATION: conversion is ONE real runBatch flush and tags survive', asyn
     const convertCalls: string[][] = [];
     const snapshots: string[][] = [];
     const deps: QueueDeps = {
-      providers: { 'spotify-direct': provider, 'youtube-match': provider },
+      providers: { 'spotify-direct': provider, 'youtube-match': provider, 'youtube-direct': provider },
       ffmpeg: bins.ffmpeg,
       ffprobe: bins.ffprobe,
       scratch: dir,

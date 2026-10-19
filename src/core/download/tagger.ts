@@ -33,7 +33,7 @@ export interface WriteTagsOptions {
   ffmpeg: string;
   /** 1-based track number written as the `track` tag. */
   trackNumber?: number;
-  /** Cover image (JPEG/PNG) to embed; ignored where CONTAINER_SUPPORT says no. */
+  /** Cover image (JPEG/PNG/WebP) to embed; ignored where CONTAINER_SUPPORT says no. */
   coverPath?: string | null;
   /** ffmpeg kill timer; default 60 s — tagging a song is not a render. */
   timeoutMs?: number;
@@ -70,7 +70,13 @@ export async function writeTags(
 
   if (wantCover) {
     args.push('-map', '0:a', '-map', '1');
-    args.push('-c', 'copy');
+    // The artwork is re-encoded rather than copied. yt-dlp reports `.webp`
+    // thumbnails, and neither m4a nor mp3 can carry a webp stream at all —
+    // measured, `-c copy` dies with "Could not find tag for codec webp in
+    // stream #1" and exit -22, leaving the whole tagging step failed. mjpeg is
+    // the attached-picture codec both containers expect, and re-encoding a
+    // JPEG cover to it is lossless enough to be invisible.
+    args.push('-c:a', 'copy', '-c:v', 'mjpeg');
   } else {
     args.push('-c', 'copy');
   }

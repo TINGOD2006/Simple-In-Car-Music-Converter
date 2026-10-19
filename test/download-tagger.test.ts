@@ -147,6 +147,45 @@ test('writeTags attaches a cover picture and tags to .m4a', async () => {
   }
 });
 
+test('a webp cover — what yt-dlp actually reports — still attaches to .m4a', async () => {
+  if (skipUnlessAvailable()) return;
+  const ffmpeg = bins!.ffmpeg;
+  const ffprobe = bins!.ffprobe;
+  const dir = scratch('m4a-webp-cover');
+  try {
+    const raw = await makeAudio(ffmpeg, dir, 'aac', '.m4a');
+
+    // Review Focus 5 / R7: YouTube thumbnails are WebP, and the tagger was
+    // built against Spotify's JPEG CDN. Measured: `-c copy` refuses the webp
+    // stream outright ("Could not find tag for codec webp in stream #1",
+    // exit -22), which used to fail the whole tagging step.
+    const cover = join(dir, 'cover.webp');
+    const enc = await runFfmpeg(
+      ffmpeg,
+      ['-y', '-hide_banner', '-loglevel', 'error',
+       '-f', 'lavfi', '-i', 'color=blue:s=300x300', '-frames:v', '1', cover],
+      { cwd: dir, timeoutMs: 30_000 },
+    );
+    assertEq(enc.code, 0, 'webp cover fixture encodes');
+
+    await writeTags(raw, META, { ffmpeg, trackNumber: 1, coverPath: cover });
+
+    const rawJson = await rawProbe(ffprobe, raw, dir);
+    const pic = (rawJson.streams ?? []).find(
+      (s) => s.codec_type === 'video' && (s.disposition?.attached_pic ?? 0) === 1,
+    );
+    assert(pic !== undefined, 'the webp cover is attached, not silently dropped');
+    assertEq(pic?.codec_name, 'mjpeg', 'and re-encoded to the container-native codec');
+    assert(
+      (rawJson.streams ?? []).some((s) => s.codec_type === 'audio'),
+      'the audio stream survives the embed',
+    );
+    assertEq(rawJson.format?.tags?.title, META.title, 'tags are still written alongside it');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('writeTags writes id3v2.3 tags plus cover to .mp3', async () => {
   if (skipUnlessAvailable()) return;
   const ffmpeg = bins!.ffmpeg;
