@@ -955,7 +955,16 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
           return;
         }
         if (req.method === 'PUT') {
-          const body = (await readBody(req)) as { spotifyCookie?: unknown; destination?: unknown };
+          const raw: unknown = await readBody(req);
+          // A JSON body that is not an object (null, a string, a number, an
+          // array) has no keys to patch. Without this guard the `in` checks
+          // below throw on null and the catch-all answers 500 with an internal
+          // V8 message, which tells the client nothing and looks like our bug.
+          if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+            send(res, 400, { ok: false, error: '設定內容必須是 JSON 物件' });
+            return;
+          }
+          const body = raw as { spotifyCookie?: unknown; destination?: unknown };
           const patch: { spotifyCookie?: string | null; destination?: string | null } = {};
           if ('spotifyCookie' in body) {
             if (body.spotifyCookie === null) {
@@ -982,6 +991,12 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
               return;
             }
           }
+          // A patch that names no known key changes nothing. Writing anyway
+          // would create config.json out of thin air on a pure no-op.
+          if (patch.spotifyCookie === undefined && patch.destination === undefined) {
+            send(res, 200, { ok: true });
+            return;
+          }
           writeDownloadSettings(patch, opts.settingsDirs);
           send(res, 200, { ok: true });
           return;
@@ -995,7 +1010,9 @@ function makeHandler(opts: ServerOptions, bins: BinPaths) {
       // unknown `/api/...` request (a wrong method, or a typo) has no file
       // extension, so serveStatic would hand back index.html with status 200
       // and the client would fail parsing HTML as JSON instead of seeing 404.
-      if (webRoot && req.method === 'GET' && !path.startsWith('/api/')) {
+      // The bare `/api` is checked too: `startsWith('/api/')` alone lets the
+      // API base itself through as a 200 HTML page.
+      if (webRoot && req.method === 'GET' && path !== '/api' && !path.startsWith('/api/')) {
         if (serveStatic(webRoot, path, res)) return;
       }
 

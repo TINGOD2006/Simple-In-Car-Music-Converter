@@ -12,7 +12,7 @@
  * response body of ANY endpoint.
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Server } from 'node:http';
@@ -398,5 +398,78 @@ test('settings remembers a destination', async () => {
     assertEq(r.status, 200, '200');
     const after = await get(base, '/api/download/settings');
     assertEq(after.json.destination, target, 'the destination round trips');
+  });
+});
+
+test('settings refuses a body that is not a JSON object with 400, not 500', async () => {
+  await withServer(async ({ base }) => {
+    const bodies: unknown[] = [null, 'sp_dc=abcdef123456', 5, true, []];
+    for (const body of bodies) {
+      const r = await put(base, '/api/download/settings', body);
+      assertEq(r.status, 400, `${JSON.stringify(body)} is a 400, not a 500`);
+      assertEq(r.json.ok, false, `${JSON.stringify(body)}: ok:false`);
+      assert(
+        !/operator|undefined|null is not/i.test(r.json.error),
+        `${JSON.stringify(body)}: the message is a user-facing one, not internal JS text (got ${r.json.error})`,
+      );
+    }
+  });
+});
+
+test('an empty settings patch answers 200 without writing a config file', async () => {
+  await withServer(async ({ base, dir }) => {
+    const r = await put(base, '/api/download/settings', {});
+    assertEq(r.status, 200, '200 for a no-op patch');
+    assert(
+      !existsSync(join(dir, 'config', 'config.json')),
+      'a patch that changes nothing must not create the config file',
+    );
+  });
+});
+
+test('the API base itself is a 404, not the SPA shell', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aus-dlapi-spa-'));
+  const webRoot = join(dir, 'web');
+  mkdirSync(webRoot, { recursive: true });
+  writeFileSync(join(webRoot, 'index.html'), '<html>SPA SHELL</html>', 'utf8');
+  const { server, port } = await startServer({
+    port: 0,
+    webRoot,
+    scratchRoot: join(dir, 'scratch'),
+    settingsDirs: [join(dir, 'config')],
+  });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const ui = await fetch(`${base}/somewhere`);
+    assertEq(ui.status, 200, 'an ordinary UI path still gets the shell');
+
+    for (const target of ['/api', '/api?x=1', '/api/', '/api/nope']) {
+      const res = await fetch(`${base}${target}`);
+      const text = await res.text();
+      assertEq(res.status, 404, `${target} is a 404`);
+      assert(!text.includes('SPA SHELL'), `${target} must not fall back to the SPA shell`);
+    }
+  } finally {
+    setDownloadOverridesForTests(null);
+    await new Promise<void>((r) => (server as Server).close(() => r()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('re-selecting tracks while a job runs is a new download, not the old one', async () => {
+  await withServer(async ({ base, dir }) => {
+    setDownloadOverridesForTests({ providers: { 'youtube-direct': fileProvider(400, []) } });
+    const source = sourceOf('Reselect', 3);
+    const common = { source, route: 'youtube-direct', destination: dir, preset: usbPreset() };
+
+    const first = await post(base, '/api/download/start', { ...common, trackIndices: [0] });
+    assertEq(first.status, 202, '202 accepted');
+
+    const second = await post(base, '/api/download/start', { ...common, trackIndices: [1, 2] });
+    assertEq(second.status, 202, '202 again');
+    assert(
+      second.json.downloadId !== first.json.downloadId,
+      'a different track selection must not silently return the still-running old job',
+    );
   });
 });

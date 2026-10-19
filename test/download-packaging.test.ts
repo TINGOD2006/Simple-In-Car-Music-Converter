@@ -16,11 +16,13 @@
  *   4. bumping the pin is a documented three-step procedure, not folklore.
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assert, assertEq, test } from './harness.ts';
+import { EXPECTED_SHA256, EXPECTED_SIZE } from '../tools/fetch-ytdlp.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
@@ -108,12 +110,46 @@ test('the smoke script is manual-only and drives the route it claims', () => {
   );
 });
 
+/**
+ * `tools/bundle-download-vendor.mjs` is the documented way to regenerate
+ * `src/vendor/download-deps.js`, so it must reproduce the committed file.
+ *
+ * esbuild keeps third-party licence notices by default (`legalComments: 'eof'`),
+ * and the committed bundle ends with that block. Switching the option to `'none'`
+ * would make the documented command emit a 1,041-byte-smaller file: it would
+ * dirty the tree on every run AND silently drop the licences for undici, ws and
+ * long.js. Nothing else compares the bundle to its entry point, so this is where
+ * that drift is caught.
+ */
+test('regenerating the vendor bundle reproduces the committed artefact', () => {
+  const script = read('tools/bundle-download-vendor.mjs');
+  assert(
+    !/legalComments\s*:\s*'none'/.test(script),
+    'the bundler must not strip legal comments — the committed bundle keeps them',
+  );
+  assert(
+    read('src/vendor/download-deps.js').includes('Bundled license information'),
+    'the committed bundle carries the licence block the bundler has to reproduce',
+  );
+});
+
 test('a built release carries the pinned binary, or the search is skipped loudly', () => {
   const candidates = [
     join(ROOT, 'release', 'bin', 'yt-dlp.exe'),
     join(ROOT, 'release', 'engine', 'bin', 'yt-dlp.exe'),
     join(ROOT, 'build', 'yt-dlp.exe'),
   ];
+  // The SHIPPED path is the one that matters, and it is not `release/`: the
+  // desktop release assembles `dist/AudioUsbStudio-<version>-win-x64/`.
+  try {
+    for (const entry of readdirSync(join(ROOT, 'dist'), { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name.startsWith('AudioUsbStudio-')) {
+        candidates.push(join(ROOT, 'dist', entry.name, 'engine', 'bin', 'yt-dlp.exe'));
+      }
+    }
+  } catch {
+    /* no dist/ yet — the release build has not run on this machine */
+  }
   const found = candidates.find((p) => existsSync(p));
   if (!found) {
     // The full build runs at release time, not once per suite run, so its
@@ -124,5 +160,7 @@ test('a built release carries the pinned binary, or the search is skipped loudly
     );
     return;
   }
-  assertEq(statSync(found).size, 17840399, `the shipped binary at ${found} must be the pinned build`);
+  assertEq(statSync(found).size, EXPECTED_SIZE, `the shipped binary at ${found} must be the pinned build`);
+  const digest = createHash('sha256').update(readFileSync(found)).digest('hex');
+  assertEq(digest, EXPECTED_SHA256, `the shipped binary at ${found} must hash to the pin, not just match its size`);
 });

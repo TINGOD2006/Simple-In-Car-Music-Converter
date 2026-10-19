@@ -1,6 +1,6 @@
-// Bundles the third-party download dependencies (vendored spdl + YouTube libs)
-// into a single ESM file. The ONLY external kept is re-unplayplay — a native
-// prebuilt that ships as real files beside the packaged exe (see
+// Bundles the third-party download dependency (the vendored spdl Spotify
+// client) into a single ESM file. The ONLY external kept is re-unplayplay — a
+// native prebuilt that ships as real files beside the packaged exe (see
 // tools/vendor/spdl-src/PATCHES.md). Run: node tools/bundle-download-vendor.mjs
 import { build } from 'esbuild';
 import { fileURLToPath } from 'node:url';
@@ -29,7 +29,12 @@ const result = await build({
     },
     minify: false,
     sourcemap: false,
-    legalComments: 'none',
+    // Keep third-party licence notices (esbuild's default). Setting 'none' here
+    // would make this command emit a file 1 041 bytes smaller than the committed
+    // src/vendor/download-deps.js: every run would dirty the tree AND silently
+    // drop the undici / ws / long.js notices. The committed bundle is the
+    // output of THIS script, so the option must stay at the default.
+    legalComments: 'eof',
     logLevel: 'info',
     metafile: true,
 });

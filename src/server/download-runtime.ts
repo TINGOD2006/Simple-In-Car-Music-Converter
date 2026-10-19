@@ -166,7 +166,28 @@ export function startFromApi(
   preset: ExportPreset,
   trackIndices?: number[],
 ): string {
-  const key = `${source.platform}|${source.kind}|${source.name}|${destination}`;
+  // The platform owns the route for YouTube: `spotify-direct` cannot play a
+  // video id, and silently trying would produce a confusing per-track failure.
+  const effective: DownloadRoute = source.platform === 'youtube' ? 'youtube-direct' : route;
+
+  // The key has to describe the WORK, not just the source. Two requests for the
+  // same playlist that differ in track selection, route or preset are different
+  // jobs: keying on name+destination alone made a re-selection return the
+  // still-running old job, so the UI showed the user's freshly chosen tracks as
+  // 已取消 while someone else's selection downloaded. A double-click sends an
+  // identical body, so it still collapses to one job. `\u0000` cannot occur in
+  // any of these values, so no two different jobs can share a key.
+  const key = [
+    source.platform,
+    source.kind,
+    source.name,
+    destination,
+    effective,
+    // `ExportPreset` carries no id — it is a value type — so its own values are
+    // the identity. JSON key order is the literal's order, stable per call site.
+    JSON.stringify(preset),
+    [...(trackIndices ?? [])].sort((a, b) => a - b).join(','),
+  ].join('\u0000');
   const q = downloadQueue(deps);
 
   const existingId = activeKeys.get(key);
@@ -176,9 +197,6 @@ export function startFromApi(
     activeKeys.delete(key);
   }
 
-  // The platform owns the route for YouTube: `spotify-direct` cannot play a
-  // video id, and silently trying would produce a confusing per-track failure.
-  const effective: DownloadRoute = source.platform === 'youtube' ? 'youtube-direct' : route;
   const id = q.start(source, effective, destination, preset, trackIndices);
   activeKeys.set(key, id);
   return id;
