@@ -186,6 +186,20 @@ function main() {
     } else {
       log('      note: deep-filter.exe absent — AI denoise will report unavailable.');
     }
+
+    // yt-dlp.exe is fetched, never committed (see tools/bin/.gitignore), so a
+    // machine that has never run the fetch script simply cannot ship a working
+    // downloader. That is a note here and a hard failure in the release build,
+    // which is the difference between "this build has no YouTube" and "this
+    // release is broken".
+    const ytDlp = join(ROOT, 'tools', 'bin', 'yt-dlp.exe');
+    if (existsSync(ytDlp)) {
+      cpSync(ytDlp, join(outDir, 'bin', 'yt-dlp.exe'));
+      log('      yt-dlp.exe (Spotify/YouTube downloads)');
+    } else {
+      log('      note: yt-dlp.exe absent — every download route will report unavailable.');
+      log('            run `node tools/fetch-ytdlp.mjs` before shipping.');
+    }
   } else {
     log('[5/6] skipping toolchain copy (--no-tools)');
   }

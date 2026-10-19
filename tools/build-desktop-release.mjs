@@ -24,11 +24,13 @@
  */
 
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -37,6 +39,11 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { unblockTree } from './unblock-release.mjs';
+import {
+  EXPECTED_SHA256,
+  EXPECTED_SIZE,
+  VERSION as YTDLP_VERSION,
+} from './fetch-ytdlp.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -262,6 +269,7 @@ const required = [
   join('engine', 'bin', 'ffmpeg.exe'),
   join('engine', 'bin', 'ffprobe.exe'),
   join('engine', 'bin', 'deep-filter.exe'),
+  join('engine', 'bin', 'yt-dlp.exe'),
 ];
 
 const missing = required.filter((rel) => !existsSync(join(outDir, rel)));
@@ -269,6 +277,27 @@ if (missing.length > 0) {
   for (const rel of missing) log(`MISSING ${rel}`);
   log(`\nthe release is incomplete: ${missing.length} required file(s) missing`);
   process.exit(1);
+}
+
+// The downloader is the one shipped binary that is fetched rather than built, so
+// a copy could silently be the wrong build — a stale pin, a partial download, or
+// a file someone replaced by hand. Verify the bytes against the same pin
+// tools/fetch-ytdlp.mjs enforces, and refuse to ship a mismatch.
+{
+  const shipped = join(outDir, 'engine', 'bin', 'yt-dlp.exe');
+  const bytes = readFileSync(shipped);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const sizeOk = bytes.length === EXPECTED_SIZE;
+  const hashOk = EXPECTED_SHA256 === '' || sha256 === EXPECTED_SHA256;
+  log(`\nyt-dlp.exe  ${YTDLP_VERSION}  ${human(bytes.length)}`);
+  log(`  FOUND  engine\\bin\\yt-dlp.exe`);
+  log(`  size   ${sizeOk ? 'match' : `MISMATCH — the pin says ${EXPECTED_SIZE}`}`);
+  log(`  sha256 ${EXPECTED_SHA256 === '' ? '(unpinned)' : hashOk ? 'match' : 'MISMATCH'}`);
+  if (!sizeOk || !hashOk) {
+    log('\nthe downloader does not match the pin in tools/fetch-ytdlp.mjs');
+    log('re-run `node tools/fetch-ytdlp.mjs`, or update the pin if the bump was intentional');
+    process.exit(1);
+  }
 }
 
 log('[5/5] clearing the download tag so SmartScreen stays quiet');
