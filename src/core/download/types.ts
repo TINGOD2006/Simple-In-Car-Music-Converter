@@ -41,7 +41,11 @@ export type TrackState =
 export interface ResolvedSource {
   /** Which service this came from — decides which routes can serve it. */
   platform: Platform;
-  kind: 'track' | 'album' | 'playlist';
+  /**
+   * `video` is one YouTube video, `track` one Spotify track; `album` and
+   * `playlist` are multi-track on both services.
+   */
+  kind: 'track' | 'album' | 'playlist' | 'video';
   name: string;
   /** true = degraded metadata (oEmbed fallback): name only, no track list. */
   partial?: boolean;

@@ -9,6 +9,9 @@
  * 200 tracks is a hard error, never a silent slice.
  */
 
+import { DownloadFailure } from './errors.ts';
+import { detectPlatform } from './parse.ts';
+import { resolveYouTubeSource, type YouTubeResolveDeps } from './sources/youtube.ts';
 import type { ResolvedSource, SpotifyApiTrack, SpotifyClient, TrackMeta } from './types.ts';
 
 /** Playlists larger than this are rejected with a split suggestion. */
@@ -143,4 +146,28 @@ export async function resolveSource(url: string, client: SpotifyClient | null): 
     if (err instanceof PlaylistTooLargeError) throw err; // cap failure must not be masked by the fallback
     return oEmbedResolve(url, parsed.kind); // R1: client/network breakage → public metadata
   }
+}
+
+/**
+ * Resolve whichever platform the pasted URL belongs to.
+ *
+ * This is the only entry point the server API calls. `detectPlatform` decides,
+ * and an unrecognised host is a typed `unsupported-url` failure rather than a
+ * misleading "not a Spotify link" — which is what the caller would otherwise
+ * have had to guess from two separate parsers disagreeing.
+ *
+ * `resolve.ts` and `sources/youtube.ts` import each other: the YouTube source
+ * reuses `PLAYLIST_CAP` and `PlaylistTooLargeError` from here. The cycle is
+ * safe because neither module touches the other's bindings while evaluating —
+ * each only calls into the other from inside a function body.
+ */
+export async function resolveAnySource(
+  url: string,
+  client: SpotifyClient | null,
+  deps: YouTubeResolveDeps,
+): Promise<ResolvedSource> {
+  const platform = detectPlatform(url);
+  if (platform === 'youtube') return resolveYouTubeSource(url, deps);
+  if (platform === 'spotify') return resolveSource(url, client);
+  throw new DownloadFailure('unsupported-url', `不支援的連結：${url}`);
 }
