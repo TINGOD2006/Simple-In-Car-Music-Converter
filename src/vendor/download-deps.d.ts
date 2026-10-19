@@ -5,8 +5,8 @@
 // This file is the ONLY type surface src/ sees — never import from node_modules
 // in src/.
 //
-// The YouTube declarations that used to end this file are gone: @distube/ytdl-core
-// and @tnfangel/ytmusic-api were removed after both stopped working against
+// The YouTube declarations that used to end this file are gone: the ytdl-core
+// and ytmusic-api packages were removed after both stopped working against
 // YouTube's bot gate, and YouTube now goes through the pinned yt-dlp binary.
 import type { Readable } from 'node:stream';
 
