@@ -1,8 +1,12 @@
 // Task 2 of docs/superpowers/plans/2026-10-18-cross-platform-download.md — vendor bundle + deps façade.
+// Re-pinned by Task 8 of docs/superpowers/plans/2026-10-19-youtube-source.md, after
+// @distube/ytdl-core and @tnfangel/ytmusic-api were dropped: the façade is now the
+// SPOTIFY surface only.
 // Pins: (1) the façade surface the download providers compile against,
-//       (2) the committed bundle imports ONLY node builtins (+ the single lazy native import),
-//       (3) spdl's stream endpoints really are compiled in.
-import { readFileSync } from 'node:fs';
+//       (2) no source file still reaches for the retired vendor YouTube surface,
+//       (3) the committed bundle imports ONLY node builtins (+ the single lazy native import),
+//       (4) spdl's stream endpoints really are compiled in.
+import { readFileSync, readdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -10,6 +14,7 @@ import { test, assert, assertEq } from './harness.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bundlePath = path.join(here, '..', 'src', 'vendor', 'download-deps.js');
+const srcRoot = path.join(here, '..', 'src');
 
 // Node builtins the bundle is allowed to import (bundled with platform=node, so all of
 // these stay external). Anything else appearing as a specifier is a packaging bug:
@@ -25,12 +30,46 @@ test('deps façade exposes the download surface', async () => {
     const deps = await import('../src/core/download/deps.ts');
     assertEq(typeof deps.createSpotifyClient, 'function', 'createSpotifyClient');
     assertEq(typeof deps.SPDL_FORMATS.includes, 'function', 'SPDL_FORMATS is a list');
-    assertEq(typeof deps.searchYouTubeMusic, 'function', 'searchYouTubeMusic');
-    assertEq(typeof deps.getYouTubeStream, 'function', 'getYouTubeStream');
-    assertEq(typeof deps.getYouTubeInfo, 'function', 'getYouTubeInfo');
     assertEq(typeof deps.SpotifyAuthError, 'function', 'SpotifyAuthError is an error class');
     assertEq(typeof deps.SpotifyStreamError, 'function', 'SpotifyStreamError is an error class');
     assertEq(typeof deps.SpotifyApiError, 'function', 'SpotifyApiError is an error class');
+});
+
+function walkTs(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) out.push(...walkTs(full));
+        else if (entry.name.endsWith('.ts')) out.push(full);
+    }
+    return out;
+}
+
+test('no source file still reaches for the retired vendor YouTube surface', () => {
+    // The packages that provided these were removed, so a lingering reference is
+    // not merely dead code — it is a runtime crash waiting for the one caller.
+    // NOTE: `YouTubeSongRow` is deliberately NOT in this list. It is now OUR type
+    // (src/core/download/sources/youtube.ts); what is retired is importing it from
+    // the vendor façade.
+    const retiredFns = ['searchYouTubeMusic', 'getYouTubeAudio', 'getYouTubeStream', 'getYouTubeInfo'];
+    const offenders: string[] = [];
+    for (const file of walkTs(srcRoot)) {
+        const text = readFileSync(file, 'utf8');
+        const rel = path.relative(srcRoot, file);
+        for (const name of retiredFns) {
+            if (new RegExp(`\\b${name}\\b`).test(text)) offenders.push(`${rel}: ${name}`);
+        }
+        // Import statements span lines, so match the whole braced clause rather
+        // than a single line.
+        for (const m of text.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s*from\s*["'][^"']*(?:vendor\/download-deps\.js|(?:^|[./])deps\.ts)["']/g)) {
+            const clause = m[1]!;
+            if (/\bYouTubeSongRow\b/.test(clause)) offenders.push(`${rel}: imports YouTubeSongRow from the vendor façade`);
+            for (const name of retiredFns) {
+                if (new RegExp(`\\b${name}\\b`).test(clause)) offenders.push(`${rel}: re-exports ${name} from the vendor façade`);
+            }
+        }
+    }
+    assertEq(offenders.join(', '), '', 'the vendor YouTube surface is retired, not just unreferenced');
 });
 
 test('SPDL format list covers the vorbis ladder plus the lossy fallbacks', async () => {

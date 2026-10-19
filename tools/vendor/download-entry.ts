@@ -22,10 +22,6 @@ import {
 } from "./spdl-src/src/lib/errors.js";
 import type { SpdlFormat, SpdlOptions } from "./spdl-src/src/lib/types.js";
 import { getIdFromURL, validateURL } from "./spdl-src/src/lib/url.js";
-
-import ytdlCore from "@distube/ytdl-core";
-import YTMusic from "@tnfangel/ytmusic-api";
-
 export { Spotify };
 export { AudioType, Endpoints, Formats, premiumFormats };
 export { getIdFromURL, validateURL };
@@ -119,77 +115,3 @@ export function downloadTrackStream(
     return stream;
 }
 
-// ---------------------------------------------------------------------------
-// YouTube Music (Route B)
-// ---------------------------------------------------------------------------
-
-export interface YouTubeSongRow {
-    videoId: string;
-    title: string;
-    artistName: string;
-    albumName: string | null;
-    durationSec: number | null;
-    thumbnailUrl: string | null;
-}
-
-export async function searchYouTubeMusic(query: string): Promise<YouTubeSongRow[]> {
-    const yt = new YTMusic();
-    const rows = (await yt.searchSongs(query)) as any[];
-    if (!Array.isArray(rows)) return [];
-    return rows
-        .map((row): YouTubeSongRow => ({
-            videoId: String(row?.videoId ?? ""),
-            title: String(row?.name ?? ""),
-            artistName: String(row?.artist?.name ?? ""),
-            albumName: row?.album?.name ? String(row.album.name) : null,
-            durationSec: typeof row?.duration === "number" ? row.duration : null,
-            thumbnailUrl: Array.isArray(row?.thumbnails) && row.thumbnails.length
-                ? String(row.thumbnails[row.thumbnails.length - 1]?.url ?? "")
-                : null,
-        }))
-        .filter((row) => row.videoId.length > 0);
-}
-
-export function getYouTubeStream(url: string, options?: { quality?: string }): PassThrough | import("node:stream").Readable {
-    return ytdlCore(url, {
-        filter: "audioonly",
-        quality: options?.quality ?? "highestaudio",
-    } as any) as any;
-}
-
-export async function getYouTubeInfo(url: string): Promise<{
-    videoId: string;
-    title: string;
-    durationSec: number | null;
-    author: string;
-    isLive: boolean;
-}> {
-    const info = await (ytdlCore as any).getInfo(url);
-    const details = info?.videoDetails ?? {};
-    const lengthSeconds = Number(details.lengthSeconds);
-    return {
-        videoId: String(details.videoId ?? ""),
-        title: String(details.title ?? ""),
-        durationSec: Number.isFinite(lengthSeconds) ? lengthSeconds : null,
-        author: String(details.author?.name ?? ""),
-        isLive: details.isLiveContent === true,
-    };
-}
-
-/**
- * Best audio-only stream plus the container it will actually land in
- * ("webm" → .webm, "mp4" (m4a/opus-in-mp4) → .m4a). Callers write to a temp
- * name and rename to the container-specific extension afterwards.
- */
-export async function getYouTubeAudio(url: string): Promise<{
-    stream: import("node:stream").Readable;
-    container: ".webm" | ".m4a";
-}> {
-    const info = await (ytdlCore as any).getInfo(url);
-    const format = (ytdlCore as any).chooseFormat(info.formats, {
-        filter: "audioonly",
-        quality: "highestaudio",
-    });
-    const stream = (ytdlCore as any).downloadFromInfo(info, { format });
-    return { stream, container: format?.container === "mp4" ? ".m4a" : ".webm" };
-}

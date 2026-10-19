@@ -14,10 +14,8 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@distube/ytdl-core": "4.16.12",
     "@spdl/unplayplay": "1.0.9",
     "@spdl/widevine": "0.3.1",
-    "@tnfangel/ytmusic-api": "5.3.0",
     "@types/node": "^26.6.5",
     "base-x": "5.0.1",
     "esbuild": "^0.28.2",
