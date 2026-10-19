@@ -1,8 +1,9 @@
 # tools/ — DeepFilterNet (external AI denoise stage)
 
-This directory holds the **AI denoise** integration for AudioUsbStudio: how to
-obtain `deep-filter.exe`, and the measured evidence for why it is *not* part of the
-batch pipeline.
+This directory holds AudioUsbStudio's **external binaries**: how to obtain them,
+and the measured evidence behind how they are used. The bulk of this file covers
+the **AI denoise** integration (`deep-filter.exe`) and why it is *not* part of the
+batch pipeline; §6 covers `yt-dlp.exe`, the YouTube audio downloader.
 
 ---
 
@@ -198,3 +199,76 @@ node test/run.ts
 Unit tests always run. Integration tests (including the measurements above) **skip with
 a printed notice** when `deep-filter.exe` or ffmpeg is absent, so the suite stays green
 on a machine that has not downloaded the binary.
+
+---
+
+## 6. `yt-dlp.exe` — YouTube audio download
+
+Both download routes that touch YouTube (`youtube-direct` and `youtube-match`) shell out
+to `yt-dlp.exe`. It is **not committed**; fetch it once per machine:
+
+```powershell
+$p='C:\Users\TINGOD\Desktop\CodeHome\AudioUsbStudio'; Set-Location $p
+node tools/fetch-ytdlp.mjs
+```
+
+It downloads the pinned release into `tools/bin/yt-dlp.exe`:
+
+| Field | Value |
+|---|---|
+| Release | `2026.08.19` (yt-dlp/yt-dlp) |
+| Asset | `yt-dlp.exe` |
+| Size | `17,840,399` bytes |
+| sha256 | `66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a` |
+
+The script verifies both size and sha256 and deletes a partial download, so a truncated
+file can never masquerade as a valid install. Use `--out <path>` to place it elsewhere,
+and point the app at it with the `AUS_YTDLP_DIR` environment variable.
+
+### Why a Node script instead of `curl`
+
+The same measurement as §2: PowerShell's `curl`, `Invoke-WebRequest` and .NET
+`HttpClient` **all fail** against GitHub release redirects, while Node's global `fetch`
+succeeds.
+
+### Why a separate binary at all
+
+The pure-JS extractors this project previously bundled are both dead against YouTube's
+current bot gate. Measured on this machine on the same ten popular music videos:
+`@distube/ytdl-core`'s `getInfo()` throws `Failed to find any playable formats` for
+**every** video, and a hand-written InnerTube client using the `ANDROID_VR` player
+returns playable formats for **1 of 10** — the other nine answer `LOGIN_REQUIRED`,
+`Sign in to confirm you're not a bot`. `yt-dlp` resolves **10 of 10**, and a real
+download was probing-verified: `kJQP7kiw5Fk.webm`, 4,605,080 bytes, ffprobe
+`codec_name=opus sample_rate=48000 channels=2 format_name=matroska,webm
+bit_rate=130862`.
+
+### ⚠️ It cannot be executed in this sandbox
+
+The official asset is a PyInstaller one-file executable, and this project's sandbox
+denies it the temp-directory self-extraction it needs:
+
+```
+[PYI-33408:ERROR] Failed to create parent directory structure.
+```
+
+That is an environment limitation, not a defect in the binary — but it means every
+automated test must **inject a runner double** and no test may invoke `yt-dlp`. Coverage
+of the real binary is the manual smoke script (`tools/smoke-download.mjs`), never CI.
+The wrapper's own stderr capture is unit-tested against `process.execPath` instead.
+
+### How the wrapper talks to it
+
+`src/core/ytdlp.ts`. This sandbox denies *piped* stdio to child processes
+(`spawn EPERM`), so stdout is discarded and stderr is redirected to a **file
+descriptor** the wrapper opens itself — `stdio: ['ignore', 'ignore', <fd>]`. Structured
+data never comes back on stdout either: `yt-dlp -J` would print into the void, so
+resolution uses `--print-to-file`, which still writes its file with stdout discarded.
+
+### Bumping the release
+
+See `docs/download-maintenance.md`. In short: change `VERSION`, `EXPECTED_SIZE` and
+`EXPECTED_SHA256` together in `tools/fetch-ytdlp.mjs`, re-run the fetch, then run the
+smoke script — the three pins are one unit and a partial update is worse than a stale
+pin.
+

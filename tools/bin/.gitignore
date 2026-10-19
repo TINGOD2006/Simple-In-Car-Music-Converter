@@ -1,7 +1,8 @@
-﻿# The DeepFilterNet binary is a 27 MB platform-specific release artifact and must
-# never be committed. Fetch it per machine with:
+# The binaries in this directory are platform-specific release artifacts and must
+# never be committed. Fetch them per machine with:
 #
-#   node tools/fetch-deep-filter.mjs
+#   node tools/fetch-deep-filter.mjs   -> deep-filter.exe  (27 MB)
+#   node tools/fetch-ytdlp.mjs         -> yt-dlp.exe       (17.8 MB)
 #
 # See tools/README.md for the release, size and sha256 to verify against.
 *
