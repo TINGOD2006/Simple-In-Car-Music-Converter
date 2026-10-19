@@ -10,7 +10,7 @@
 
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { join } from 'node:path';
 
 import { test, assert, assertEq } from './harness.ts';
 import { DownloadFailure } from '../src/core/download/errors.ts';
@@ -48,7 +48,18 @@ function opts(signal: AbortSignal = new AbortController().signal): DownloadOpts 
   return { destination: 'unused', signal, timeoutMs: 30_000 };
 }
 
-/** The `-o` template is `<destBase>.%(ext)s`; recover `<destBase>` from the args. */
+/**
+ * The stem the provider must build out of `META`, with no extension. This is the
+ * exact name the queue's skip rule probes for, so getting it wrong here is the
+ * difference between a download landing and being invisible.
+ */
+const STEM = `${META.artists} - ${META.title}`;
+
+function stemIn(dir: string): string {
+  return join(dir, STEM);
+}
+
+/** The queue hands `download()` a folder; the `-o` template is `<dir>/<stem>.%(ext)s`. */
 function destBaseOf(args: string[]): string {
   const at = args.indexOf('-o');
   const template = at === -1 ? '' : (args[at + 1] ?? '');
@@ -110,7 +121,7 @@ test('download builds the measured argument shape', async () => {
       }, calls)),
     );
 
-    await provider.download(META, join(dir, 'Luis Fonsi - Despacito'), opts());
+    await provider.download(META, dir, opts());
 
     const args = calls[0]?.args ?? [];
     assert(args.includes('--force-overwrites'), 'force-overwrites is required: the queue owns the skip rule');
@@ -118,6 +129,7 @@ test('download builds the measured argument shape', async () => {
     assertEq(args[args.indexOf('-f') + 1], 'bestaudio/best', 'the format selector follows -f');
     assert(args.includes('--no-playlist'), 'a single video must not expand into a playlist');
     assert(!args.includes('--write-info-json'), 'no sidecar is written; the landed file is discovered');
+    assertEq(args[args.indexOf('-o') + 1], `${stemIn(dir)}.%(ext)s`, 'the output template is the queue\'s own skip target');
     assertEq(args[args.length - 1], META.sourceId, 'the video id is the last argument');
     assertEq(args[args.length - 2], '--', 'the id is separated from the options');
     assertEq(calls[0]?.cwd, dir, 'the child runs in the scratch directory');
@@ -126,7 +138,7 @@ test('download builds the measured argument shape', async () => {
 
 test('download returns the file the runner actually wrote', async () => {
   await withScratch(async (dir) => {
-    const destBase = join(dir, 'Luis Fonsi - Despacito');
+    const destBase = stemIn(dir);
     const provider = createYoutubeDirectProvider(
       deps(dir, fakeRun((base) => {
         writeFileSync(`${base}.webm`, Buffer.alloc(4096));
@@ -134,7 +146,7 @@ test('download returns the file the runner actually wrote', async () => {
       })),
     );
 
-    const { rawPath } = await provider.download(META, destBase, opts());
+    const { rawPath } = await provider.download(META, dir, opts());
     assertEq(rawPath, `${destBase}.webm`, 'rawPath is the landed webm');
     assertEq(sizeOf(rawPath), 4096, 'and it is the real file, not a stub');
   });
@@ -142,7 +154,7 @@ test('download returns the file the runner actually wrote', async () => {
 
 test('cancelling deletes the extension-bearing partial yt-dlp leaves behind', async () => {
   await withScratch(async (dir) => {
-    const destBase = join(dir, 'Luis Fonsi - Despacito');
+    const destBase = stemIn(dir);
     const controller = new AbortController();
     const provider = createYoutubeDirectProvider(
       deps(dir, fakeRun((base) => {
@@ -153,7 +165,7 @@ test('cancelling deletes the extension-bearing partial yt-dlp leaves behind', as
       })),
     );
 
-    const err = await rejection(provider.download(META, destBase, opts(controller.signal)));
+    const err = await rejection(provider.download(META, dir, opts(controller.signal)));
     assert(err instanceof DownloadFailure, `expected a DownloadFailure, got ${String(err)}`);
     assertEq((err as DownloadFailure).reason, 'cancelled', 'reason');
     assertEq(existsSync(`${destBase}.webm.part`), false, 'the .webm.part orphan is gone');
@@ -163,7 +175,7 @@ test('cancelling deletes the extension-bearing partial yt-dlp leaves behind', as
 
 test('a sub-1 KB stub is replaced, not treated as a finished download', async () => {
   await withScratch(async (dir) => {
-    const destBase = join(dir, 'Luis Fonsi - Despacito');
+    const destBase = stemIn(dir);
     writeFileSync(`${destBase}.webm`, Buffer.alloc(500));
 
     const calls: RunCall[] = [];
@@ -174,7 +186,7 @@ test('a sub-1 KB stub is replaced, not treated as a finished download', async ()
       }, calls)),
     );
 
-    const { rawPath } = await provider.download(META, destBase, opts());
+    const { rawPath } = await provider.download(META, dir, opts());
     assertEq(rawPath, `${destBase}.webm`, 'the same target path is reused');
     assertEq(sizeOf(rawPath), 3000, 'the 500-byte stub was overwritten, so --force-overwrites is load-bearing');
     assertEq(calls.length, 1, 'the download ran exactly once');
@@ -190,7 +202,7 @@ test('an unavailable video surfaces as video-unavailable', async () => {
       }))),
     );
 
-    const err = await rejection(provider.download(META, join(dir, 'x'), opts()));
+    const err = await rejection(provider.download(META, dir, opts()));
     assert(err instanceof DownloadFailure, `expected a DownloadFailure, got ${String(err)}`);
     assertEq((err as DownloadFailure).reason, 'video-unavailable', 'reason');
   });
@@ -204,7 +216,7 @@ test('a missing binary names the fetch script instead of failing as an i/o error
       }),
     );
 
-    const err = await rejection(provider.download(META, join(dir, 'x'), opts()));
+    const err = await rejection(provider.download(META, dir, opts()));
     assert(err instanceof DownloadFailure, `expected a DownloadFailure, got ${String(err)}`);
     assertEq((err as DownloadFailure).reason, 'ytdlp-missing', 'reason');
     assert((err as Error).message.includes('tools/fetch-ytdlp.mjs'), `the message must name the fix, got ${(err as Error).message}`);
@@ -213,7 +225,7 @@ test('a missing binary names the fetch script instead of failing as an i/o error
 
 test('several landed candidates resolve to the newest, deterministically', async () => {
   await withScratch(async (dir) => {
-    const destBase = join(dir, 'Luis Fonsi - Despacito');
+    const destBase = stemIn(dir);
     const provider = createYoutubeDirectProvider(
       deps(dir, fakeRun((base) => {
         writeFileSync(`${base}.m4a`, Buffer.alloc(2048));
@@ -225,9 +237,9 @@ test('several landed candidates resolve to the newest, deterministically', async
       })),
     );
 
-    const { rawPath } = await provider.download(META, destBase, opts());
+    const { rawPath } = await provider.download(META, dir, opts());
     assertEq(rawPath, `${destBase}.webm`, 'the newer of the two containers wins');
-    assertEq(readdirSync(dir).filter((n) => n.startsWith(basename(destBase))).length, 2, 'both candidates exist');
+    assertEq(readdirSync(dir).filter((n) => n.startsWith(STEM)).length, 2, 'both candidates exist');
   });
 });
 

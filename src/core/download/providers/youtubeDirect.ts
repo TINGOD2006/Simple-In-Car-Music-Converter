@@ -1,11 +1,14 @@
 /**
  * The `youtube-direct` route (plan Task 6): paste a YouTube URL, get the audio.
  *
- * yt-dlp decides the container, so the provider never gets to name the file it
- * is about to receive — `-o "<destBase>.%(ext)s"` lets the downloader append
- * whatever extension it actually produced, and the provider then *discovers*
- * the result by scanning for the known audio containers. That is also why
- * `rawExtensions` is a list here and not the single scalar it used to be.
+ * yt-dlp decides the container, so the provider cannot name the file exactly:
+ * `-o "<dir>/<artists> - <title>.%(ext)s"` lets the downloader append whatever
+ * extension it actually produced, and the provider then *discovers* the result
+ * by scanning for the known audio containers. Both the folder and the stem are
+ * the provider's to build, because the queue hands `download()` a destination
+ * directory and its skip rule looks for `<dir>/<artists> - <title><ext>`.
+ * That is also why `rawExtensions` is a list here and not the single scalar it
+ * used to be.
  *
  * Two yt-dlp behaviours this depends on, both measured (see the design spec):
  *   - `--force-overwrites` is required because the queue, not yt-dlp, owns the
@@ -15,11 +18,12 @@
  *     into the partial's name — so cleanup cannot look for `<name>.part`.
  */
 
-import { readdirSync, rmSync, statSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { mkdirSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 
 import { classifyYtDlpFailure, findYtDlp, runYtDlp } from '../../ytdlp.ts';
 import { DownloadFailure } from '../errors.ts';
+import { sanitizeFilename } from '../resolve.ts';
 import { resolveYouTubeSource, ytDlpFailureMessage, type YtDlpRunner } from '../sources/youtube.ts';
 import type { DownloadOpts, DownloadProvider, ResolvedSource, TrackMeta } from '../types.ts';
 
@@ -139,10 +143,13 @@ export function createYoutubeDirectProvider(deps: YoutubeDirectDeps): DownloadPr
       return resolveYouTubeSource(url, { bin, scratch: deps.scratch, run: runnerFor(bin) });
     },
 
-    async download(track: TrackMeta, destBase: string, opts: DownloadOpts): Promise<{ rawPath: string }> {
+    async download(track: TrackMeta, destination: string, opts: DownloadOpts): Promise<{ rawPath: string }> {
       const bin = resolveBin(deps);
-      const dir = dirname(destBase);
-      const base = basename(destBase);
+      const dir = destination;
+      // The queue passes a destination FOLDER; the file name is the provider's
+      // job, and it has to be the same one the queue's skip rule probes.
+      const base = sanitizeFilename(`${track.artists} - ${track.title}`);
+      mkdirSync(dir, { recursive: true });
 
       const args = [
         '-f',
@@ -150,7 +157,7 @@ export function createYoutubeDirectProvider(deps: YoutubeDirectDeps): DownloadPr
         '--no-playlist',
         '--force-overwrites',
         '-o',
-        `${destBase}.%(ext)s`,
+        join(dir, `${base}.%(ext)s`),
         '--',
         track.sourceId,
       ];

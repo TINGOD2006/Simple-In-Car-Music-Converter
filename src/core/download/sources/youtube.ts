@@ -103,24 +103,50 @@ function lastThumbnail(json: string): string {
   }
 }
 
-function rowToMeta(line: string): TrackMeta | null {
+/**
+ * One parsed `--print-to-file` row, before it is shaped for either consumer.
+ *
+ * `durationSec` is already 0 when the field was absent and `artist` already
+ * carries the `uploader ?? channel` fallback, because both consumers need the
+ * same answers and must not each re-invent them.
+ */
+interface ParsedRow {
+  sourceId: string;
+  title: string;
+  artist: string;
+  durationSec: number;
+  thumbnailUrl: string;
+}
+
+function parseRow(line: string): ParsedRow | null {
   const cols = line.split('\t');
   const sourceId = clean(cols[COL_ID] ?? '');
   if (sourceId === '') return null;
 
   const seconds = Number(clean(cols[COL_DURATION] ?? ''));
   return {
+    sourceId,
     title: clean(cols[COL_TITLE] ?? ''),
     // yt-dlp carries no artist/album for YouTube sources; the channel is the artist.
-    artists: clean(cols[COL_UPLOADER] ?? '') || 'YouTube',
-    album: '',
+    artist: clean(cols[COL_UPLOADER] ?? '') || 'YouTube',
     durationSec: Number.isFinite(seconds) && seconds > 0 ? seconds : 0,
-    coverUrl: lastThumbnail(clean(cols[COL_THUMBNAILS] ?? '')),
-    sourceId,
+    thumbnailUrl: lastThumbnail(clean(cols[COL_THUMBNAILS] ?? '')),
   };
 }
 
-function readRows(file: string): TrackMeta[] {
+function rowToMeta(row: ParsedRow): TrackMeta {
+  return {
+    title: row.title,
+    artists: row.artist,
+    album: '',
+    durationSec: row.durationSec,
+    coverUrl: row.thumbnailUrl,
+    sourceId: row.sourceId,
+  };
+}
+
+/** Read a row file written by `--print-to-file`; a missing file means "no rows". */
+function readRows(file: string): ParsedRow[] {
   let text: string;
   try {
     text = readFileSync(file, 'utf8');
@@ -128,13 +154,13 @@ function readRows(file: string): TrackMeta[] {
     // No file at all is "nothing resolved", not a crash: a failed run writes none.
     return [];
   }
-  const tracks: TrackMeta[] = [];
+  const rows: ParsedRow[] = [];
   for (const line of text.split('\n')) {
     if (line.trim() === '') continue;
-    const meta = rowToMeta(line);
-    if (meta) tracks.push(meta);
+    const row = parseRow(line);
+    if (row) rows.push(row);
   }
-  return tracks;
+  return rows;
 }
 
 /* ------------------------------------------------------------------ */
@@ -201,17 +227,79 @@ export async function resolveYouTubeSource(
     throw new DownloadFailure(reason, ytDlpFailureMessage(reason, result.stderr));
   }
 
-  const tracks = readRows(out);
-  if (tracks.length === 0) {
+  const rows = readRows(out);
+  if (rows.length === 0) {
     throw new DownloadFailure(
       'no-tracks',
       '這個連結沒有可下載的曲目（播放清單可能是空的，或所有曲目都無法存取）',
     );
   }
-  if (tracks.length > PLAYLIST_CAP) throw new PlaylistTooLargeError(tracks.length);
+  if (rows.length > PLAYLIST_CAP) throw new PlaylistTooLargeError(rows.length);
+
+  const tracks = rows.map(rowToMeta);
 
   // yt-dlp reports no playlist title in this mode, and inventing one would lie
   // about which list was pasted — the id is at least exact and unique.
   const name = parsed.kind === 'video' ? (tracks[0]?.title ?? parsed.id) : parsed.id;
   return { platform: 'youtube', kind: parsed.kind, name, tracks };
+}
+
+/**
+ * A YouTube Music search result, shaped for `youtube-match`'s scorer.
+ *
+ * This type used to live in the vendor declarations because the search used to
+ * come from a vendored package. Both are ours now, so the row shape is ours too.
+ */
+export interface YouTubeSongRow {
+  videoId: string;
+  title: string;
+  artistName: string;
+  /** Search rows carry no album; always ''. */
+  albumName: string | null;
+  durationSec: number | null;
+  thumbnailUrl: string | null;
+}
+
+/** How many candidates a match attempt scores; more only widens the wrong guess. */
+export const SEARCH_LIMIT = 5;
+
+/**
+ * Search YouTube for `query`, returning scoring candidates.
+ *
+ * The invocation is deliberately identical to `resolveYouTubeSource`'s, with a
+ * `ytsearch5:` pseudo-URL in place of a real one: it is the same
+ * `--print-to-file` channel, and it is the direct route's own command shape
+ * rather than a second, subtly different one.
+ */
+export async function searchYouTubeRows(
+  query: string,
+  deps: YouTubeResolveDeps,
+): Promise<YouTubeSongRow[]> {
+  const out = rowFile(deps.scratch);
+  const result = await resolveRunner(deps)(
+    [
+      '--flat-playlist',
+      '--simulate',
+      '--no-warnings',
+      '--print-to-file',
+      TEMPLATE,
+      out,
+      `ytsearch${SEARCH_LIMIT}:${query}`,
+    ],
+    { cwd: deps.scratch },
+  );
+
+  if (result.code !== 0) {
+    const reason = classifyYtDlpFailure(result.code, result.stderr);
+    throw new DownloadFailure(reason, ytDlpFailureMessage(reason, result.stderr));
+  }
+
+  return readRows(out).map((row) => ({
+    videoId: row.sourceId,
+    title: row.title,
+    artistName: row.artist,
+    albumName: '',
+    durationSec: row.durationSec > 0 ? row.durationSec : null,
+    thumbnailUrl: row.thumbnailUrl === '' ? null : row.thumbnailUrl,
+  }));
 }
