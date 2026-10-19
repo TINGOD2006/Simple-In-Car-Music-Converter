@@ -70,7 +70,7 @@ export function trackToMeta(
     album: album?.name ?? '',
     durationSec: t.duration_ms / 1000,
     coverUrl: album?.images?.[0]?.url ?? '',
-    spotifyId: t.id,
+    sourceId: t.id,
   };
 }
 
@@ -95,7 +95,7 @@ async function oEmbedResolve(url: string, kind: SpotifyUrlKind): Promise<Resolve
   const res = await fetch(endpoint);
   if (!res.ok) throw new Error(`Spotify oEmbed 查詢失敗（HTTP ${res.status}）`);
   const body = (await res.json()) as OEmbedPayload;
-  return { kind, name: body.title ?? '', partial: true, tracks: [] };
+  return { platform: 'spotify', kind, name: body.title ?? '', partial: true, tracks: [] };
 }
 
 export async function resolveSource(url: string, client: SpotifyClient | null): Promise<ResolvedSource> {
@@ -107,13 +107,13 @@ export async function resolveSource(url: string, client: SpotifyClient | null): 
   try {
     if (parsed.kind === 'track') {
       const t = await client.request<SpotifyApiTrack>(`${WEB_API}tracks/${parsed.id}`);
-      return { kind: 'track', name: t.name, tracks: [trackToMeta(t)] };
+      return { platform: 'spotify', kind: 'track', name: t.name, tracks: [trackToMeta(t)] };
     }
 
     if (parsed.kind === 'album') {
       const a = await client.request<AlbumResponse>(`${WEB_API}albums/${parsed.id}`);
       const tracks = (a.tracks?.items ?? []).map((item) => trackToMeta(item, { name: a.name, images: a.images }));
-      return { kind: 'album', name: a.name, tracks };
+      return { platform: 'spotify', kind: 'album', name: a.name, tracks };
     }
 
     // Playlist: cap check on the reported total BEFORE fetching everything,
@@ -138,7 +138,7 @@ export async function resolveSource(url: string, client: SpotifyClient | null): 
       pages += 1;
     }
     if (metas.length > PLAYLIST_CAP) metas.length = PLAYLIST_CAP; // defensive slice AFTER the cap check
-    return { kind: 'playlist', name: first.name, tracks: metas };
+    return { platform: 'spotify', kind: 'playlist', name: first.name, tracks: metas };
   } catch (err) {
     if (err instanceof PlaylistTooLargeError) throw err; // cap failure must not be masked by the fallback
     return oEmbedResolve(url, parsed.kind); // R1: client/network breakage → public metadata

@@ -29,7 +29,7 @@ import { runBatch } from '../batch.ts';
 import { probe } from '../probe.ts';
 import { CONTAINER_SUPPORT, fetchCover, writeTags } from './tagger.ts';
 import { sanitizeFilename } from './resolve.ts';
-import { DownloadFailure } from './providers/youtubeMatch.ts';
+import { DownloadFailure } from './errors.ts';
 import type { ExportPreset } from '../types.ts';
 import type {
   DownloadOpts,
@@ -424,12 +424,19 @@ export function createDownloadQueue(deps: QueueDeps): DownloadQueue {
 
     // Skip-if-exists: a raw already sitting at the destination with real bytes
     // is a finished download from an earlier run. Half-written files (<= 1 KiB)
-    // are not, and get fetched again.
-    const expected = join(
-      st.record.destination,
-      `${sanitizeFilename(`${meta.artists} - ${meta.title}`)}${st.provider.rawExtension}`,
-    );
-    if (existsSync(expected) && sizeOf(expected) > SKIP_ABOVE_BYTES) {
+    // are not, and get fetched again. A provider may land in more than one
+    // container (a YouTube download is webm or m4a), so every extension it can
+    // produce is a candidate and the first one holding real bytes wins.
+    const base = sanitizeFilename(`${meta.artists} - ${meta.title}`);
+    let expected: string | null = null;
+    for (const ext of st.provider.rawExtensions) {
+      const candidate = join(st.record.destination, `${base}${ext}`);
+      if (existsSync(candidate) && sizeOf(candidate) > SKIP_ABOVE_BYTES) {
+        expected = candidate;
+        break;
+      }
+    }
+    if (expected !== null) {
       entry.rawPath = expected;
       entry.state = 'skipped';
       return;

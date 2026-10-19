@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 
 import { getYouTubeAudio, type YouTubeSongRow } from '../deps.ts';
+import { DownloadFailure } from '../errors.ts';
 import { sanitizeFilename } from '../resolve.ts';
 import type { DownloadOpts, DownloadProvider, TrackMeta } from '../types.ts';
 
@@ -26,19 +27,6 @@ export const DURATION_GATE_SEC = 3;
 export const FALLBACK_WINDOW_SEC = 10;
 /** Official uploads come from "<Artist> - Topic" channels — worth this bonus. */
 export const TOPIC_BONUS = 10;
-
-/**
- * Typed provider failure: `reason` is a stable machine string the queue and
- * UI key on ('no-confident-match' today; 'cookie-expired' comes from Route A).
- */
-export class DownloadFailure extends Error {
-  readonly reason: string;
-  constructor(reason: string, message: string) {
-    super(message);
-    this.name = 'DownloadFailure';
-    this.reason = reason;
-  }
-}
 
 /** lowercase, strip parenthetical qualifiers, collapse spaces. */
 export function normalizeTitle(s: string): string {
@@ -121,7 +109,7 @@ export function createYoutubeMatchProvider(overrides?: {
 
   return {
     id: 'youtube-match',
-    rawExtension: '.webm',
+    rawExtensions: ['.webm', '.m4a'],
     // Metadata enrichment happens upstream (the API resolves with a logged-in
     // client first); a bare provider resolve degrades to the public oEmbed.
     async resolve(url) {

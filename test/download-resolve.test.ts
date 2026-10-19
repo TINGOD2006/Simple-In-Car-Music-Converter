@@ -105,7 +105,7 @@ test('trackToMeta maps the Web API shape onto TrackMeta', () => {
     album: 'Back In Black',
     durationSec: 255,
     coverUrl: 'https://i.scdn.co/a.jpg',
-    spotifyId: '4uLU6hMCjMI75M1A2tKUQC',
+    sourceId: '4uLU6hMCjMI75M1A2tKUQC',
   }, 'meta mapping: artists joined, ms→s, first image');
 });
 

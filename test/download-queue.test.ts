@@ -36,7 +36,7 @@ import type {
   ResolvedSource,
   TrackMeta,
 } from '../src/core/download/types.ts';
-import { DownloadFailure } from '../src/core/download/providers/youtubeMatch.ts';
+import { DownloadFailure } from '../src/core/download/errors.ts';
 import { sanitizeFilename } from '../src/core/download/resolve.ts';
 import type { ExportPreset } from '../src/core/types.ts';
 
@@ -62,12 +62,12 @@ function metaOf(n: number, title?: string, artists?: string): TrackMeta {
     album: 'Album',
     durationSec: 60,
     coverUrl: '',
-    spotifyId: `id${n}`,
+    sourceId: `id${n}`,
   };
 }
 
 function sourceOf(tracks: TrackMeta[], name = 'Test Album'): ResolvedSource {
-  return { kind: 'track', name, tracks };
+  return { kind: 'track', name, platform: 'spotify', tracks };
 }
 
 interface MockState { calls: string[] }
@@ -82,12 +82,12 @@ type MockBehavior = (
 function instantProvider(state: MockState, behavior: MockBehavior): DownloadProvider {
   return {
     id: 'spotify-direct',
-    rawExtension: '.ogg',
+    rawExtensions: ['.ogg'],
     async resolve() {
       throw new Error('resolve unused in queue tests');
     },
     async download(track, destBase, opts) {
-      state.calls.push(track.spotifyId);
+      state.calls.push(track.sourceId);
       return behavior(track, destBase, opts, state.calls.length);
     },
   };
@@ -98,8 +98,29 @@ function writeRawBehavior(state: MockState): MockBehavior {
   return async (track, destBase) => {
     mkdirSync(destBase, { recursive: true });
     const rawPath = join(destBase, `${sanitizeFilename(`${track.artists} - ${track.title}`)}.ogg`);
-    writeFileSync(rawPath, `raw ${track.spotifyId}`);
+    writeFileSync(rawPath, `raw ${track.sourceId}`);
     return { rawPath };
+  };
+}
+
+/**
+ * A provider whose raw can land in either container (as the YouTube routes
+ * genuinely can: yt-dlp yields webm or m4a depending on the video).
+ */
+function multiExtProvider(state: MockState): DownloadProvider {
+  return {
+    id: 'youtube-match',
+    rawExtensions: ['.webm', '.m4a'],
+    async resolve() {
+      throw new Error('resolve unused in queue tests');
+    },
+    async download(track, destBase) {
+      state.calls.push(track.sourceId);
+      mkdirSync(destBase, { recursive: true });
+      const rawPath = join(destBase, `${sanitizeFilename(`${track.artists} - ${track.title}`)}.webm`);
+      writeFileSync(rawPath, `raw ${track.sourceId}`);
+      return { rawPath };
+    },
   };
 }
 
@@ -156,7 +177,7 @@ test('queue never exceeds two concurrent downloads', async () => {
     peak = Math.max(peak, inFlight);
     await new Promise((r) => setTimeout(r, 30));
     inFlight -= 1;
-    return { rawPath: `X:\\never\\${track.spotifyId}.ogg` };
+    return { rawPath: `X:\\never\\${track.sourceId}.ogg` };
   });
   const queue = createDownloadQueue(stubDeps(provider));
   const tracks = [1, 2, 3, 4, 5].map((n) => metaOf(n));
@@ -186,8 +207,8 @@ test('jitter sleeps between a record\u2019s track starts, within [500,1500] ms',
 test('a hanging provider times out and the queue continues with the next track', async () => {
   const state: MockState = { calls: [] };
   const provider = instantProvider(state, async (track) => {
-    if (track.spotifyId === 'id0') await new Promise(() => { /* hangs forever */ });
-    return { rawPath: `X:\\never\\${track.spotifyId}.ogg` };
+    if (track.sourceId === 'id0') await new Promise(() => { /* hangs forever */ });
+    return { rawPath: `X:\\never\\${track.sourceId}.ogg` };
   });
   const convertCalls: string[] = [];
   const queue = createDownloadQueue(stubDeps(provider, {
@@ -211,7 +232,7 @@ test('cancel mid-flight aborts the download and the partial file is gone', async
     let partPath = '';
     const provider: DownloadProvider = {
       id: 'spotify-direct',
-      rawExtension: '.ogg',
+      rawExtensions: ['.ogg'],
       async resolve() { throw new Error('unused'); },
       download(_track, destBase, opts) {
         return new Promise((_res, rej) => {
@@ -273,10 +294,10 @@ test('retry re-queues only the requested failed indices', async () => {
   const state: MockState = { calls: [] };
   const seen = new Map<string, number>();
   const provider = instantProvider(state, async (track) => {
-    const nth = (seen.get(track.spotifyId) ?? 0) + 1;
-    seen.set(track.spotifyId, nth);
-    if (track.spotifyId === 'id0' && nth === 1) throw new Error('transient io failure');
-    return { rawPath: `X:\\never\\${track.spotifyId}.ogg` };
+    const nth = (seen.get(track.sourceId) ?? 0) + 1;
+    seen.set(track.sourceId, nth);
+    if (track.sourceId === 'id0' && nth === 1) throw new Error('transient io failure');
+    return { rawPath: `X:\\never\\${track.sourceId}.ogg` };
   });
   const queue = createDownloadQueue(stubDeps(provider));
   const id = queue.start(sourceOf([metaOf(0), metaOf(1)]), 'spotify-direct', 'Q:\\unused', PRESET);
@@ -297,9 +318,9 @@ test('retry re-queues only the requested failed indices', async () => {
 test('a cookie-expired failure fails every still-queued track fast', async () => {
   const state: MockState = { calls: [] };
   const provider = instantProvider(state, async (track) => {
-    if (track.spotifyId === 'id0') throw new DownloadFailure('cookie-expired', 'sp_dc 已失效');
+    if (track.sourceId === 'id0') throw new DownloadFailure('cookie-expired', 'sp_dc 已失效');
     await new Promise((r) => setTimeout(r, 25));
-    return { rawPath: `X:\\never\\${track.spotifyId}.ogg` };
+    return { rawPath: `X:\\never\\${track.sourceId}.ogg` };
   });
   const queue = createDownloadQueue(stubDeps(provider));
   const id = queue.start(
@@ -365,7 +386,7 @@ test('INTEGRATION: conversion is ONE real runBatch flush and tags survive', asyn
          '-c:a', 'libvorbis', rawPath],
         { cwd: dir, timeoutMs: 30_000 },
       );
-      assertEq(r.code, 0, `fixture for ${track.spotifyId} encodes`);
+      assertEq(r.code, 0, `fixture for ${track.sourceId} encodes`);
       return { rawPath };
     });
 
@@ -416,8 +437,8 @@ test('INTEGRATION: conversion is ONE real runBatch flush and tags survive', asyn
 test('a no-confident-match failure does not stop the other tracks', async () => {
   const state: MockState = { calls: [] };
   const provider = instantProvider(state, async (track) => {
-    if (track.spotifyId === 'id1') throw new DownloadFailure('no-confident-match', '找不到對應版本');
-    return { rawPath: `X:\\never\\${track.spotifyId}.ogg` };
+    if (track.sourceId === 'id1') throw new DownloadFailure('no-confident-match', '找不到對應版本');
+    return { rawPath: `X:\\never\\${track.sourceId}.ogg` };
   });
   const queue = createDownloadQueue(stubDeps(provider));
   const id = queue.start(sourceOf([metaOf(0), metaOf(1), metaOf(2)]), 'spotify-direct', 'Q:\\unused', PRESET);
@@ -431,10 +452,10 @@ test('rate-limit pauses globally and retries the track once', async () => {
   const state: MockState = { calls: [] };
   const seen = new Map<string, number>();
   const provider = instantProvider(state, async (track) => {
-    const nth = (seen.get(track.spotifyId) ?? 0) + 1;
-    seen.set(track.spotifyId, nth);
-    if (track.spotifyId === 'id0' && nth === 1) throw new DownloadFailure('rate-limit', '429');
-    return { rawPath: `X:\\never\\${track.spotifyId}.ogg` };
+    const nth = (seen.get(track.sourceId) ?? 0) + 1;
+    seen.set(track.sourceId, nth);
+    if (track.sourceId === 'id0' && nth === 1) throw new DownloadFailure('rate-limit', '429');
+    return { rawPath: `X:\\never\\${track.sourceId}.ogg` };
   });
   const slept: number[] = [];
   const queue = createDownloadQueue(stubDeps(provider, {
@@ -447,4 +468,60 @@ test('rate-limit pauses globally and retries the track once', async () => {
   assertEq(rec.tracks[0]?.state, 'done', 'rate-limited track succeeded on retry');
   assertEq(state.calls.filter((c) => c === 'id0').length, 2, 'rate-limited track ran twice');
   assertEq(state.calls.filter((c) => c === 'id1').length, 1, 'the other track ran once');
+});
+
+/* ------------------------------------------------------------------ */
+/* Skip-if-exists across a provider's whole extension list (Task 4)     */
+/* ------------------------------------------------------------------ */
+
+test('skip-if-exists matches a raw under the second extension', async () => {
+  const state: MockState = { calls: [] };
+  const provider = multiExtProvider(state);
+  const meta = metaOf(1);
+  const dir = scratch('skip-second-ext');
+  try {
+    const expected = join(dir, `${sanitizeFilename(`${meta.artists} - ${meta.title}`)}.m4a`);
+    writeFileSync(expected, Buffer.alloc(2048));
+    const queue = createDownloadQueue(stubDeps(provider));
+    const id = queue.start(sourceOf([meta]), 'youtube-match', dir, PRESET);
+    const rec = await untilFinished(queue, id);
+    assertEq(rec.tracks[0]?.state, 'skipped', 'an existing .m4a counts as a finished download');
+    assertEq(state.calls.length, 0, 'the provider was never called');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('skip-if-exists re-downloads a sub-1 KiB raw', async () => {
+  const state: MockState = { calls: [] };
+  const provider = multiExtProvider(state);
+  const meta = metaOf(2);
+  const dir = scratch('skip-too-small');
+  try {
+    const expected = join(dir, `${sanitizeFilename(`${meta.artists} - ${meta.title}`)}.webm`);
+    writeFileSync(expected, Buffer.alloc(500));
+    const queue = createDownloadQueue(stubDeps(provider));
+    const id = queue.start(sourceOf([meta]), 'youtube-match', dir, PRESET);
+    const rec = await untilFinished(queue, id);
+    assertEq(rec.tracks[0]?.state, 'done', 'a half-written raw is fetched again');
+    assertEq(state.calls.length, 1, 'the provider ran once');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('skip-if-exists downloads when no candidate extension exists', async () => {
+  const state: MockState = { calls: [] };
+  const provider = multiExtProvider(state);
+  const meta = metaOf(3);
+  const dir = scratch('skip-none');
+  try {
+    const queue = createDownloadQueue(stubDeps(provider));
+    const id = queue.start(sourceOf([meta]), 'youtube-match', dir, PRESET);
+    const rec = await untilFinished(queue, id);
+    assertEq(rec.tracks[0]?.state, 'done', 'nothing to skip');
+    assertEq(state.calls.length, 1, 'the provider ran once');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

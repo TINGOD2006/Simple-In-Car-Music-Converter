@@ -10,6 +10,9 @@
 
 export type DownloadRoute = 'spotify-direct' | 'youtube-match';
 
+/** Which upstream service a resolved source, or a track in it, came from. */
+export type Platform = 'spotify' | 'youtube';
+
 export interface TrackMeta {
   title: string;
   /** Artist names joined with ', ' — also the display and filename source. */
@@ -18,7 +21,11 @@ export interface TrackMeta {
   durationSec: number;
   /** First album image URL, or '' when the source has none. */
   coverUrl: string;
-  spotifyId: string;
+  /**
+   * The platform-native identifier: a Spotify track id, or a YouTube video id.
+   * This is what a provider hands back to its own service.
+   */
+  sourceId: string;
 }
 
 export type TrackState =
@@ -32,6 +39,8 @@ export type TrackState =
   | 'cancelled';
 
 export interface ResolvedSource {
+  /** Which service this came from — decides which routes can serve it. */
+  platform: Platform;
   kind: 'track' | 'album' | 'playlist';
   name: string;
   /** true = degraded metadata (oEmbed fallback): name only, no track list. */
@@ -48,8 +57,12 @@ export interface DownloadOpts {
 
 export interface DownloadProvider {
   readonly id: DownloadRoute;
-  /** Container the provider's raw stream lands in, before tag+convert. */
-  readonly rawExtension: '.ogg' | '.webm' | '.m4a';
+  /**
+   * Containers this provider's raw stream may land in, before tag+convert.
+   * A list because a YouTube download yields webm or m4a depending on the
+   * video; the queue tests each in order when hunting for an existing raw.
+   */
+  readonly rawExtensions: readonly ('.ogg' | '.webm' | '.m4a')[];
   resolve(url: string): Promise<ResolvedSource>;
   download(track: TrackMeta, destBase: string, opts: DownloadOpts): Promise<{ rawPath: string }>;
 }

@@ -13,12 +13,12 @@ import { join } from 'node:path';
 import { assert, assertEq, test } from './harness.ts';
 import {
   CONFIDENCE_FLOOR,
-  DownloadFailure,
   createYoutubeMatchProvider,
   normalizeTitle,
   pickCandidate,
   scoreCandidates,
 } from '../src/core/download/providers/youtubeMatch.ts';
+import { DownloadFailure } from '../src/core/download/errors.ts';
 import type { TrackMeta } from '../src/core/download/types.ts';
 import type { YouTubeSongRow } from '../src/vendor/download-deps.js';
 
@@ -28,7 +28,7 @@ const META: TrackMeta = {
   album: 'Back In Black',
   durationSec: 255,
   coverUrl: '',
-  spotifyId: '4uLU6hMCjMI75M1A2tKUQC',
+  sourceId: '4uLU6hMCjMI75M1A2tKUQC',
 };
 
 function cand(over: Partial<YouTubeSongRow>): YouTubeSongRow {

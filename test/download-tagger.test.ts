@@ -111,7 +111,7 @@ const META: TrackMeta = {
   album: '測試專輯',
   durationSec: 1,
   coverUrl: '',
-  spotifyId: '3n3PamnLuyFSbkgxjjB9YX',
+  sourceId: '3n3PamnLuyFSbkgxjjB9YX',
 };
 
 /* ------------------------------------------------------------------ */

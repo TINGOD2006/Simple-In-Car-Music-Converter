@@ -12,7 +12,10 @@
  * single regex has to guess which part it matched.
  */
 
-export type Platform = 'spotify' | 'youtube';
+import type { Platform } from './types.ts';
+
+/** Re-exported so URL parsing stays a single import site for its callers. */
+export type { Platform };
 
 export interface ParsedUrl {
   platform: Platform;
