@@ -23,7 +23,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 import { appRoot } from './approot.ts';
@@ -48,12 +48,54 @@ export const YTDLP_DIR_ENV = 'AUS_YTDLP_DIR';
  */
 const REPORT_PREFIX = 'ytdlp-report-';
 
+/**
+ * Prefix of the per-run directory the child unpacks itself into.
+ *
+ * `yt-dlp.exe` is a PyInstaller ONE-FILE build: before it parses a single
+ * argument it unpacks its payload into a directory under `%TEMP%`. That makes
+ * the ambient `%TEMP%` a hard dependency of every download, and it is not one we
+ * control — it may be read-only, on a network share, on a full disk, or missing
+ * from a launcher's environment. When it is, the bootloader dies with
+ * "Could not create temporary directory!" and the user gets a 502 on a link that
+ * is perfectly good.
+ *
+ * So each run gets a directory inside our own scratch instead, which is
+ * writable by construction (the report file already lands there), and it is
+ * removed as soon as the child exits rather than being left behind like
+ * PyInstaller's `_MEI*` directories.
+ */
+const TEMP_PREFIX = 'ytdlp-temp-';
+
 /** Per-process run counter, so two concurrent calls cannot pick one name. */
 let reportSeq = 0;
 
-function reportFileName(): string {
+/**
+ * The two per-run paths inside `cwd`: the stderr file and the child's temp dir.
+ *
+ * They share one counter so a run's log and its extraction directory always pair
+ * up, and so no two runs can pick the same name.
+ */
+function nextRunPaths(cwd: string): { reportPath: string; tempDir: string } {
   reportSeq += 1;
-  return `${REPORT_PREFIX}${process.pid}-${reportSeq}.log`;
+  const stem = `${process.pid}-${reportSeq}`;
+  return {
+    reportPath: join(cwd, `${REPORT_PREFIX}${stem}.log`),
+    tempDir: join(cwd, `${TEMP_PREFIX}${stem}`),
+  };
+}
+
+/**
+ * Remove a run's extraction directory.
+ *
+ * Best effort on purpose: a leftover temp directory is cosmetic, while a throw
+ * here would replace the failure reason the caller is about to be told.
+ */
+function discardTemp(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* the OS reclaims its own temp space */
+  }
 }
 
 /**
@@ -138,6 +180,7 @@ export const YTDLP_KILL_GRACE_MS = 5_000;
  */
 export type YtDlpFailureReason =
   | 'ytdlp-missing'
+  | 'ytdlp-extract-failed'
   | 'video-unavailable'
   | 'live-unsupported'
   | 'no-audio-format'
@@ -177,15 +220,23 @@ export function runYtDlp(
   args: string[],
   opts: RunYtDlpOptions,
 ): Promise<RunYtDlpResult> {
-  const reportPath = join(opts.cwd, reportFileName());
+  const { reportPath, tempDir } = nextRunPaths(opts.cwd);
   const timeoutMs = opts.timeoutMs ?? DEFAULT_YTDLP_TIMEOUT_MS;
 
   return new Promise<RunYtDlpResult>((resolve, reject) => {
+    try {
+      mkdirSync(tempDir, { recursive: true });
+    } catch (err) {
+      reject(new Error(`Failed to create ${tempDir}: ${(err as Error).message}`));
+      return;
+    }
+
     let fd: number;
     try {
       // 'w' truncates: this run's log must never contain the last run's error.
       fd = openSync(reportPath, 'w');
     } catch (err) {
+      discardTemp(tempDir);
       reject(new Error(`Failed to open ${reportPath}: ${(err as Error).message}`));
       return;
     }
@@ -196,10 +247,20 @@ export function runYtDlp(
         cwd: opts.cwd,
         stdio: ['ignore', 'ignore', fd],
         windowsHide: true,
-        env: { ...process.env, ...(opts.env ?? {}) },
+        env: {
+          ...process.env,
+          // The one-file bootloader unpacks into `%TEMP%`, so hand it a
+          // directory we own instead of whatever the launcher left behind —
+          // see TEMP_PREFIX. Windows reads TMP before TEMP, so both are set.
+          TEMP: tempDir,
+          TMP: tempDir,
+          TMPDIR: tempDir,
+          ...(opts.env ?? {}),
+        },
       });
     } catch (err) {
       closeSync(fd);
+      discardTemp(tempDir);
       reject(new Error(`Failed to start ${bin}: ${(err as Error).message}`));
       return;
     }
@@ -238,6 +299,8 @@ export function runYtDlp(
       } catch {
         /* the report is already read; a leftover is cosmetic */
       }
+      // The extracted PyInstaller payload goes with it, for the same reason.
+      discardTemp(tempDir);
       return {
         code,
         stderr,
@@ -317,6 +380,17 @@ export function runYtDlp(
  */
 const RATE_LIMIT_RE = /sign in to confirm|not a bot|\b429\b|too many requests/i;
 
+/**
+ * The PyInstaller one-file bootloader failing to unpack itself.
+ *
+ * Checked FIRST and on its own: when it fires, yt-dlp never started, so nothing
+ * else in the log describes the video. Without this the user is told
+ * "yt-dlp 執行失敗：" followed by a bootloader line they cannot act on, when the
+ * real advice is about the extraction directory or antivirus.
+ */
+const EXTRACT_FAILED_RE =
+  /\[PYI-\d+:ERROR\]|could not create temporary directory|failed to create parent directory structure|cannot create a file when that file already exists/i;
+
 const VIDEO_UNAVAILABLE_RE =
   /this video is unavailable|video unavailable|private video|not available in your country|age.?restricted|premieres|removed by the uploader|terminated/i;
 
@@ -335,6 +409,8 @@ const NO_AUDIO_FORMAT_RE =
  */
 export function classifyYtDlpFailure(code: number, stderr: string): YtDlpFailureReason {
   const text = stderr ?? '';
+  // First: if the bootloader never unpacked, the rest of the log is noise.
+  if (EXTRACT_FAILED_RE.test(text)) return 'ytdlp-extract-failed';
   if (RATE_LIMIT_RE.test(text)) return 'rate-limit';
   if (VIDEO_UNAVAILABLE_RE.test(text)) return 'video-unavailable';
   if (LIVE_UNSUPPORTED_RE.test(text)) return 'live-unsupported';

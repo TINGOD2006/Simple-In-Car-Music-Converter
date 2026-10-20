@@ -47,6 +47,7 @@ const REASON_TEXT: Record<string, string> = {
   'io-error': '讀寫或網路錯誤',
   'unsupported-url': '不支援的連結',
   'ytdlp-missing': '找不到 yt-dlp.exe，請執行 node tools/fetch-ytdlp.mjs',
+  'ytdlp-extract-failed': 'yt-dlp.exe 無法自我解壓縮，請確認暫存資料夾可寫，並解除防毒隔離',
   'video-unavailable': '這部影片無法下載（私人、地區限制或已移除）',
   'live-unsupported': '直播無法下載',
   'no-audio-format': '這個來源沒有可用的音訊格式',

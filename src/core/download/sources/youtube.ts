@@ -169,6 +169,8 @@ function readRows(file: string): ParsedRow[] {
 
 const FAILURE_MESSAGES: Record<YtDlpFailureReason, string> = {
   'ytdlp-missing': '找不到 yt-dlp.exe — 請執行 node tools/fetch-ytdlp.mjs',
+  'ytdlp-extract-failed':
+    'yt-dlp.exe 無法自我解壓縮 — 請確認系統暫存資料夾可寫入，並把防毒對此檔的隔離解除後重試',
   'video-unavailable': '這部影片無法使用（可能已刪除、設為私人或有區域限制）',
   'live-unsupported': '直播中的影片無法下載 — 請等直播結束後再試',
   'no-audio-format': '找不到可下載的音訊格式',

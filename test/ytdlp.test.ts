@@ -16,7 +16,7 @@
  * that stalls the whole queue for 30 seconds.
  */
 
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -232,4 +232,74 @@ test('findYtDlp names the fetch script when the binary is nowhere', async () => 
       restoreApp();
     }
   });
+});
+
+/* ------------------------------------------------------------------ */
+/* The PyInstaller extraction directory                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A child that records the temp directory it was given, so the parent can prove
+ * what the run actually handed it.
+ *
+ * `yt-dlp.exe` is a PyInstaller ONE-FILE build: before doing any work it unpacks
+ * its payload into a directory under `%TEMP%`. If that path is read-only, on a
+ * network drive, or otherwise unwritable, the bootloader dies with
+ * "Could not create temporary directory!" and the user sees a 502 on a link that
+ * is perfectly good. Handing the child a directory this run owns removes the
+ * dependence on the ambient environment entirely.
+ */
+function recordEnvTo(out: string): string {
+  return [
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(out)}, `,
+    "[process.env.TEMP, process.env.TMP, process.env.TMPDIR].join('|'));",
+  ].join('');
+}
+
+test('the child gets a temp directory this run owns, not the ambient one', async () => {
+  await withScratch(async (dir) => {
+    const out = join(dir, 'temp-seen.txt');
+    const res = await runYtDlp(process.execPath, ['-e', recordEnvTo(out)], { cwd: dir });
+    assertEq(res.code, 0, 'the child exits cleanly');
+
+    const seen = readFileSync(out, 'utf8').split('|');
+    const temp = seen[0] ?? '';
+    const tmp = seen[1] ?? '';
+    const tmpdirSeen = seen[2] ?? '';
+    assert(
+      temp.startsWith(dir),
+      `TEMP must point inside this run's scratch, got ${JSON.stringify(temp)}`,
+    );
+    assertEq(tmp, temp, 'TMP must match TEMP — Windows reads TMP before TEMP');
+    assertEq(tmpdirSeen, temp, 'TMPDIR must match TEMP — the name yt-dlp also honours');
+  });
+});
+
+test('the run-owned temp directory is removed once the child exits', async () => {
+  await withScratch(async (dir) => {
+    const out = join(dir, 'temp-seen2.txt');
+    await runYtDlp(process.execPath, ['-e', recordEnvTo(out)], { cwd: dir });
+    const temp = readFileSync(out, 'utf8').split('|')[0] ?? '';
+    assert(
+      !existsSync(temp),
+      `an extracted payload must not be left behind in the scratch directory, found ${temp}`,
+    );
+  });
+});
+
+test('a PyInstaller bootloader failure is its own reason, not a generic i/o error', async () => {
+  // Both messages are the one-file bootloader refusing to unpack. This is the
+  // failure users actually hit, and "yt-dlp 執行失敗：<PYI line>" tells them
+  // nothing they can act on.
+  for (const stderr of [
+    '[PYI-15276:ERROR] Could not create temporary directory!',
+    '[PYI-32584:ERROR] Failed to create parent directory structure.',
+  ]) {
+    assertEq(
+      classifyYtDlpFailure(1, stderr),
+      'ytdlp-extract-failed',
+      `a bootloader failure must be classified as such, got ${JSON.stringify(stderr)}`,
+    );
+  }
 });
