@@ -75,12 +75,12 @@ let reportSeq = 0;
  * They share one counter so a run's log and its extraction directory always pair
  * up, and so no two runs can pick the same name.
  */
-function nextRunPaths(cwd: string): { reportPath: string; tempDir: string } {
+function nextRunPaths(cwd: string, tempBase: string): { reportPath: string; tempDir: string } {
   reportSeq += 1;
   const stem = `${process.pid}-${reportSeq}`;
   return {
     reportPath: join(cwd, `${REPORT_PREFIX}${stem}.log`),
-    tempDir: join(cwd, `${TEMP_PREFIX}${stem}`),
+    tempDir: join(tempBase, `${TEMP_PREFIX}${stem}`),
   };
 }
 
@@ -96,6 +96,35 @@ function discardTemp(dir: string): void {
   } catch {
     /* the OS reclaims its own temp space */
   }
+}
+
+/**
+ * Where the bootloader is allowed to unpack, in preference order.
+ *
+ * The scratch directory comes first because it is the run's own space and is
+ * writable by construction. That is not the whole answer: a confined launcher
+ * can let us CREATE a directory and still refuse the extraction inside it,
+ * which is exactly what `runYtDlp` retries around.
+ */
+export function ytDlpTempDirCandidates(cwd: string): string[] {
+  const out: string[] = [cwd, join(appRoot(), TEMP_PREFIX)];
+  const local = process.env.LOCALAPPDATA;
+  if (local) out.push(join(local, 'AudioUsbStudio', TEMP_PREFIX));
+  return out;
+}
+
+/**
+ * Index of the candidate that last worked, so only the first run on a given
+ * machine pays for discovering it.
+ */
+let preferredTempIndex = 0;
+
+/**
+ * Test hook: forget which location worked, so a suite can exercise the fallback
+ * without depending on whether another test already warmed it.
+ */
+export function resetYtDlpTempDirForTests(): void {
+  preferredTempIndex = 0;
 }
 
 /**
@@ -214,13 +243,17 @@ export interface RunYtDlpResult {
  * Output is never piped. Each call gets its OWN report file, opened with `'w'`
  * and removed once read: no other run can write into it, and no finished run
  * leaves it behind.
+ *
+ * `tempBase` is where the bootloader is told to unpack. It is a parameter
+ * because the right answer is machine-dependent — see `ytDlpTempDirCandidates`.
  */
-export function runYtDlp(
+function runOnce(
   bin: string,
   args: string[],
   opts: RunYtDlpOptions,
+  tempBase: string,
 ): Promise<RunYtDlpResult> {
-  const { reportPath, tempDir } = nextRunPaths(opts.cwd);
+  const { reportPath, tempDir } = nextRunPaths(opts.cwd, tempBase);
   const timeoutMs = opts.timeoutMs ?? DEFAULT_YTDLP_TIMEOUT_MS;
 
   return new Promise<RunYtDlpResult>((resolve, reject) => {
@@ -366,6 +399,54 @@ export function runYtDlp(
       resolve(collect(code ?? -1));
     });
   });
+}
+
+/**
+ * Run `yt-dlp`, moving to the next extraction location when the bootloader
+ * cannot create its own temporary directory.
+ *
+ * Measured on the machine this app was built for: a directory beside the
+ * executable unpacks fine, while `%LOCALAPPDATA%`, the system temp, and even
+ * other folders in the same user profile all fail with
+ * `[PYI-nnnn:ERROR] Could not create temporary directory!` — although a plain
+ * process can write to every one of them. The cause is the launcher confining
+ * the child, not a property of yt-dlp, so no single static location is right on
+ * every machine. Trying in order costs one extra spawn the first time and
+ * nothing afterwards.
+ */
+export async function runYtDlp(
+  bin: string,
+  args: string[],
+  opts: RunYtDlpOptions,
+): Promise<RunYtDlpResult> {
+  const candidates = ytDlpTempDirCandidates(opts.cwd);
+  let result: RunYtDlpResult | null = null;
+  let lastError: unknown = null;
+
+  for (let i = preferredTempIndex; i < candidates.length; i += 1) {
+    const dir = candidates[i];
+    if (dir === undefined) continue;
+
+    try {
+      result = await runOnce(bin, args, opts, dir);
+    } catch (err) {
+      // The location itself is unusable (a read-only install directory).
+      lastError = err;
+      continue;
+    }
+
+    // A cancelled or timed-out run says nothing about the location.
+    if (result.cancelled || result.timedOut) return result;
+    if (!EXTRACT_FAILED_RE.test(result.stderr)) {
+      preferredTempIndex = i;
+      return result;
+    }
+  }
+
+  if (result !== null) return result;
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Could not start yt-dlp: no usable extraction directory');
 }
 
 /* ------------------------------------------------------------------ */

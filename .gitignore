@@ -23,3 +23,8 @@ desktop/NuGet.config
 # scratch dirs from plan execution
 _backup-*/
 _shellprobe/
+
+# yt-dlp's working directory when the engine runs from source, and the smoke
+# script's download target (both live beside the app by design)
+ytdlp-work/
+.smoke-download-*/

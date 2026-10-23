@@ -24,9 +24,11 @@ import { assert, assertEq, test } from './harness.ts';
 import {
   classifyYtDlpFailure,
   findYtDlp,
+  resetYtDlpTempDirForTests,
   runYtDlp,
   YTDLP_DIR_ENV,
   YTDLP_EXE,
+  ytDlpTempDirCandidates,
 } from '../src/core/ytdlp.ts';
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -284,6 +286,40 @@ test('the run-owned temp directory is removed once the child exits', async () =>
     assert(
       !existsSync(temp),
       `an extracted payload must not be left behind in the scratch directory, found ${temp}`,
+    );
+  });
+});
+
+test('a bootloader that cannot unpack in the scratch is retried elsewhere', async () => {
+  // The real failure users hit: the directory is writable (we created it), the
+  // launcher still refuses the extraction, and the whole run dies before yt-dlp
+  // starts. One machine measured here unpacks only inside the app's own tree, so
+  // a single hard-coded location cannot be correct everywhere.
+  await withScratch(async (dir) => {
+    resetYtDlpTempDirForTests();
+    assert(ytDlpTempDirCandidates(dir).length >= 2, 'there must be a second location to try');
+
+    const log = join(dir, 'temp-used.txt');
+    const script =
+      "const fs = require('node:fs');" +
+      `fs.appendFileSync(${JSON.stringify(log)}, (process.env.TEMP || '') + '\\n');` +
+      `if ((process.env.TEMP || '').startsWith(${JSON.stringify(dir)})) {` +
+      "process.stderr.write('[PYI-4242:ERROR] Could not create temporary directory!\\n');" +
+      'process.exit(1); }' +
+      'process.exit(0);';
+
+    const res = await runYtDlp(process.execPath, ['-e', script], { cwd: dir });
+    assertEq(res.code, 0, 'the retry succeeds instead of surfacing the bootloader failure');
+    assertEq(res.stderr, '', 'the winning run reports its own clean stderr, not the failed attempt');
+
+    const attempts = readFileSync(log, 'utf8')
+      .split('\n')
+      .filter((line) => line.length > 0);
+    assert(attempts.length >= 2, `the child must be retried, saw ${attempts.length} attempt(s)`);
+    assert((attempts[0] ?? '').startsWith(dir), 'the first attempt still uses the run scratch');
+    assert(
+      !(attempts[1] ?? '').startsWith(dir),
+      'the retry must use a different location than the one that just failed',
     );
   });
 });

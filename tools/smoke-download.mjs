@@ -20,12 +20,14 @@
  */
 
 import { mkdtempSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { startServer } from '../src/server/index.ts';
 import { probe } from '../src/core/probe.ts';
 import { usbPreset } from '../src/core/edl.ts';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 /** `--route` accepts the UI's names and the engine's ids. */
 const ROUTES = {
@@ -108,7 +110,11 @@ async function main() {
   const settled = [];
   const { server, port } = await startServer({ port: 0 });
   const base = `http://127.0.0.1:${port}`;
-  const destination = mkdtempSync(join(tmpdir(), 'aus-smoke-'));
+  // The destination is a real download target, so it is NOT put in the system
+  // temp: measured on the machine this was built for, yt-dlp (a Python program)
+  // is denied writing under `%TEMP%` while writing the same tree here succeeds.
+  // A smoke run that fails for that reason proves nothing about the feature.
+  const destination = mkdtempSync(join(ROOT, '.smoke-download-'));
   console.log(`engine:      ${base}`);
   console.log(`route:       ${route}`);
   console.log(`url:         ${opts.url}`);

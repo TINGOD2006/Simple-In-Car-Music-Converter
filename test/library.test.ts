@@ -65,7 +65,10 @@ async function makeAudio(dir: string, name: string, freq = 440, dur = 2): Promis
 
 test('library: AUDIO_EXTENSIONS covers the formats a car stereo library accumulates', () => {
   const set = new Set(AUDIO_EXTENSIONS.map((e) => e.toLowerCase()));
-  for (const ext of ['mp3', 'wav', 'flac', 'ogg', 'oga', 'opus', 'aac', 'm4a', 'wma', 'aiff', 'alac', 'ape', 'wv', 'tta', 'ac3', 'dts', 'mka', 'amr', 'au', 'ra', 'rm', 'caf', 'mpc', 'spx']) {
+  // 'webm' is not decoration: yt-dlp's bestaudio stream for most YouTube videos
+  // is Opus in a WebM container, so a download lands as `<name>.webm` and the
+  // converter can only reach it if the scanner recognises the extension.
+  for (const ext of ['mp3', 'wav', 'flac', 'ogg', 'oga', 'opus', 'aac', 'm4a', 'webm', 'weba', 'wma', 'aiff', 'alac', 'ape', 'wv', 'tta', 'ac3', 'dts', 'mka', 'amr', 'au', 'ra', 'rm', 'caf', 'mpc', 'spx']) {
     assert(set.has(ext), `AUDIO_EXTENSIONS is missing "${ext}"`);
   }
   // Sanity: a non-audio extension must not be in the list.

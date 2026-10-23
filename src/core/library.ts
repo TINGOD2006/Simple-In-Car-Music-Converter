@@ -29,10 +29,15 @@ import type { MediaInfo } from './types.ts';
  */
 export const AUDIO_EXTENSIONS: string[] = [
   'mp3', 'wav', 'flac', 'ogg', 'oga', 'opus', 'aac', 'm4a', 'mp4',
+  // yt-dlp's bestaudio stream for most YouTube videos is Opus inside a WebM
+  // container, so a finished download lands as `<name>.webm`. Without the
+  // extension here the converter never sees the file and reports
+  // 轉換報告中沒有這個檔案 on an otherwise perfect download.
+  'webm', 'weba',
   'wma', 'aiff', 'aif', 'alac', 'ape', 'wv', 'tta', 'ac3', 'dts',
   'mka', 'amr', 'au', 'ra', 'rm', 'caf', 'mpc', 'spx',
   // Common cousins that show up in real collections.
-  'mp2', 'm4b', 'm4r', 'asf', 'oga', 'weba', 'dff', 'dsf',
+  'mp2', 'm4b', 'm4r', 'asf', 'dff', 'dsf',
 ];
 
 const EXT_SET: Set<string> = new Set(AUDIO_EXTENSIONS.map((e) => `.${e.toLowerCase()}`));

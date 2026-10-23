@@ -16,6 +16,9 @@
  * shipping path in tests.
  */
 
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { maskCookie, readDownloadSettings, writeDownloadSettings } from '../core/appsettings.ts';
 import { createSpotifyClient } from '../core/download/deps.ts';
 import { createSpotifyDirectProvider } from '../core/download/providers/spotifyDirect.ts';
@@ -28,6 +31,7 @@ import { DownloadFailure } from '../core/download/errors.ts';
 import type { SpotifyClient, DownloadProvider, DownloadRoute, ResolvedSource } from '../core/download/types.ts';
 import type { ExportPreset } from '../core/types.ts';
 import { findYtDlp } from '../core/ytdlp.ts';
+import { appRoot } from '../core/approot.ts';
 
 /** The three routes, in the order the UI offers them. */
 export const DOWNLOAD_ROUTES: readonly DownloadRoute[] = [
@@ -76,6 +80,26 @@ function ytDlpPath(): string {
   }
 }
 
+/**
+ * The directory yt-dlp is allowed to write its per-run files into.
+ *
+ * Measured on the machine this was built for: yt-dlp — a Python program — gets
+ * `EACCES` writing a `--print-to-file` target inside the engine scratch under
+ * `%TEMP%`, while a Node child writing the very same directory succeeds, and
+ * unpacking fails there too (see `runYtDlp`). Beside the app is the location
+ * that measurably works; the scratch stays as the fallback for an install
+ * directory the user cannot write to.
+ */
+function ytDlpWorkDir(fallback: string): string {
+  const beside = join(appRoot(), 'ytdlp-work');
+  try {
+    mkdirSync(beside, { recursive: true });
+    return beside;
+  } catch {
+    return fallback;
+  }
+}
+
 function buildProviders(scratch: string): Record<DownloadRoute, DownloadProvider> {
   const bin = ytDlpPath();
   const providers: Record<DownloadRoute, DownloadProvider> = {
@@ -92,10 +116,11 @@ function buildProviders(scratch: string): Record<DownloadRoute, DownloadProvider
 
 /** The process-wide queue, rebuilt only when the identity of its deps changes. */
 export function downloadQueue(deps: DownloadRuntimeDeps): DownloadQueue {
-  const key = `${deps.ffmpeg}|${deps.ffprobe}|${deps.scratch}|${Object.keys(overrides.providers ?? {}).join(',')}`;
+  const workDir = ytDlpWorkDir(deps.scratch);
+  const key = `${deps.ffmpeg}|${deps.ffprobe}|${deps.scratch}|${workDir}|${Object.keys(overrides.providers ?? {}).join(',')}`;
   if (queue && queueKey === key) return queue;
   queue = createDownloadQueue({
-    providers: buildProviders(deps.scratch),
+    providers: buildProviders(workDir),
     ffmpeg: deps.ffmpeg,
     ffprobe: deps.ffprobe,
     scratch: deps.scratch,
@@ -130,7 +155,10 @@ export async function resolveForApi(
       }
     }
   }
-  return resolveAnySource(url, client, { bin: ytDlpPath(), scratch: deps.scratch });
+  return resolveAnySource(url, client, {
+    bin: ytDlpPath(),
+    scratch: ytDlpWorkDir(deps.scratch),
+  });
 }
 
 /** Four-oh-four versus upstream: what the API should answer for a resolve failure. */
