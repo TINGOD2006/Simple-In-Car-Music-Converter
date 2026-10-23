@@ -173,6 +173,33 @@ test('cancelling deletes the extension-bearing partial yt-dlp leaves behind', as
   });
 });
 
+test('cancelling one track never deletes a concurrent sibling that shares its prefix', async () => {
+  await withScratch(async (dir) => {
+    const destBase = stemIn(dir);
+    // Two shapes that genuinely occur: a duplicate track numbered " 2", and a
+    // differently decorated upload. Both filename prefixes start with ours.
+    const numbered = `${destBase} 2.webm.part`;
+    const decorated = `${destBase} (live).webm.part`;
+    writeFileSync(numbered, Buffer.alloc(64));
+    writeFileSync(decorated, Buffer.alloc(64));
+
+    const controller = new AbortController();
+    const provider = createYoutubeDirectProvider(
+      deps(dir, fakeRun((base) => {
+        writeFileSync(`${base}.webm.part`, Buffer.alloc(64));
+        controller.abort();
+        return { code: 1, cancelled: true, stderr: '' };
+      })),
+    );
+
+    const err = await rejection(provider.download(META, dir, opts(controller.signal)));
+    assertEq((err as DownloadFailure).reason, 'cancelled', 'reason');
+    assertEq(existsSync(`${destBase}.webm.part`), false, 'our own partial is gone');
+    assertEq(existsSync(numbered), true, 'a sibling whose name extends ours is untouched');
+    assertEq(existsSync(decorated), true, 'and so is a decorated sibling');
+  });
+});
+
 test('a sub-1 KB stub is replaced, not treated as a finished download', async () => {
   await withScratch(async (dir) => {
     const destBase = stemIn(dir);

@@ -8,11 +8,12 @@
  */
 
 import { assert, assertEq, test } from './harness.ts';
-import { api } from '../web/src/api.ts';
+import { ApiError, api } from '../web/src/api.ts';
 import {
   countByState,
   defaultDestinationFor,
   looksLikeYoutubeUrl,
+  pollOutcome,
   statusPill,
 } from '../web/src/download-helpers.ts';
 import type { TrackState } from '../web/src/api-types.ts';
@@ -253,4 +254,15 @@ test('looksLikeYoutubeUrl mirrors the engine\u2019s accepted table', () => {
   ]) {
     assert(!looksLikeYoutubeUrl(bad), `must not look like a YouTube link: ${bad}`);
   }
+});
+
+test('a failed status poll stops only when the engine no longer knows the job', () => {
+  // 404 means the server that answered has no such download — it was restarted
+  // and its in-memory queue is gone. Asking again can only repeat the 404, so
+  // the tab must stop instead of polling forever with a stale "downloading".
+  assertEq(pollOutcome(new ApiError('/api/download/status', 404, 'no route')), 'stop', '404 is terminal');
+  // Everything else may be transient: the engine may come back, the 500 may clear.
+  assertEq(pollOutcome(new ApiError('/api/download/status', 0, 'offline')), 'retry', 'an unreachable engine may recover');
+  assertEq(pollOutcome(new ApiError('/api/download/status', 500, 'boom')), 'retry', 'a 5xx may be transient');
+  assertEq(pollOutcome(new Error('anything else')), 'retry', 'an unknown error keeps polling');
 });

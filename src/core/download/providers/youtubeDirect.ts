@@ -117,11 +117,26 @@ function newest(files: string[]): string {
   return best;
 }
 
-/** Remove `<base>.part` and `<base>.<ext>.part`; nothing else is ours to delete. */
+/**
+ * Remove exactly `<base>.part` and `<base>.<ext>.part` — nothing else is ours.
+ *
+ * A `startsWith(base)` rule looks equivalent and is not: "AC DC - Back In Black"
+ * is a prefix of "AC DC - Back In Black 2.webm.part", so cancelling one track
+ * deleted a concurrent sibling's partial mid-download and left that track with
+ * an empty destination. `landedFiles` above already matches exactly; this
+ * mirrors it. Also best-effort: the caller is already failing this track, and a
+ * locked file must not turn a cancellation into a crash.
+ */
 function deletePartials(dir: string, base: string): void {
+  const owned = new Set<string>([`${base}${PART_SUFFIX}`]);
+  for (const ext of LANDED_EXTENSIONS) owned.add(`${base}${ext}${PART_SUFFIX}`);
   for (const name of listDir(dir)) {
-    if (!name.startsWith(base) || !name.endsWith(PART_SUFFIX)) continue;
-    rmSync(join(dir, name), { force: true });
+    if (!owned.has(name)) continue;
+    try {
+      rmSync(join(dir, name), { force: true });
+    } catch {
+      /* best effort — see above */
+    }
   }
 }
 

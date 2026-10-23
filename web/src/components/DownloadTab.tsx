@@ -26,7 +26,7 @@ import type {
   TrackState,
 } from '../api-types.ts';
 import { useApp } from '../app-context.ts';
-import { defaultDestinationFor, describeProgress, looksLikeYoutubeUrl, statusPill } from '../download-helpers.ts';
+import { defaultDestinationFor, describeProgress, looksLikeYoutubeUrl, pollOutcome, statusPill } from '../download-helpers.ts';
 import { DEFAULT_PRESET_ID, PRESETS, type PresetChoice } from '../presets.ts';
 
 /** How often to pull a status snapshot while a download is running. */
@@ -103,10 +103,20 @@ export default function DownloadTab(): JSX.Element {
   /** The id being polled; a ref so the interval never depends on render order. */
   const pollId = useRef<string | null>(null);
 
+  /**
+   * Set when the engine answered 404 for a job it used to know: its queue is in
+   * memory, so a restart forgets every download. Stopping here is honest — we do
+   * not know how those tracks ended, so the table keeps the last snapshot and a
+   * banner says why it stopped updating.
+   */
+  const [pollLost, setPollLost] = useState(false);
+
   useEffect(() => {
+    let cancelled = false;
     void (async () => {
       try {
         const settings = await api.getDownloadSettings();
+        if (cancelled) return;
         setCookieSet(settings.spotifyCookieSet);
         setCookieHint(settings.cookieHint);
         if (settings.destination) setDestination(settings.destination);
@@ -114,6 +124,9 @@ export default function DownloadTab(): JSX.Element {
         // Settings are optional: the page still works with a folder the user picks.
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   /* ---------------------------------------------------------------- */
@@ -121,7 +134,7 @@ export default function DownloadTab(): JSX.Element {
   /* ---------------------------------------------------------------- */
 
   useEffect(() => {
-    if (!download || download.finished) return undefined;
+    if (!download || download.finished || pollLost) return undefined;
     let cancelled = false;
     const timer = setInterval(() => {
       const id = pollId.current;
@@ -130,9 +143,11 @@ export default function DownloadTab(): JSX.Element {
         try {
           const next = await api.downloadStatus(id);
           if (!cancelled) setDownload(next.download);
-        } catch {
+        } catch (err) {
           // A dropped poll is not a failure: the next tick asks again, and a
           // download that genuinely vanished is answered by the final snapshot.
+          // A 404 is different — see pollOutcome.
+          if (!cancelled && pollOutcome(err) === 'stop') setPollLost(true);
         }
       })();
     }, POLL_MS);
@@ -140,7 +155,7 @@ export default function DownloadTab(): JSX.Element {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [download]);
+  }, [download, pollLost]);
 
   /* ---------------------------------------------------------------- */
   /* Resolution                                                        */
@@ -198,6 +213,7 @@ export default function DownloadTab(): JSX.Element {
         trackIndices: [...selected].sort((a, b) => a - b),
       });
       pollId.current = res.downloadId;
+      setPollLost(false);
       const snapshot = await api.downloadStatus(res.downloadId);
       setDownload(snapshot.download);
     } catch (err) {
@@ -333,6 +349,17 @@ export default function DownloadTab(): JSX.Element {
       ) : null}
 
       {error ? <div className="banner usb-error">{error}</div> : null}
+
+      {/*
+        A 404 from the status endpoint means the engine restarted and forgot
+        every in-memory download. We do not know how those tracks ended, so the
+        table keeps the last snapshot and this says it is no longer live.
+      */}
+      {pollLost ? (
+        <div className="banner usb-warnline">
+          Node 引擎已重新啟動，這次下載的進度已無法查詢。請確認資料夾裡的檔案，必要時重新開始下載。
+        </div>
+      ) : null}
 
       {/* 2. What came back. */}
       {source ? (

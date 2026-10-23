@@ -8,6 +8,7 @@
  */
 
 import type { TrackState } from './api-types.ts';
+import { ApiError } from './api.ts';
 
 /**
  * The one-line label for a track's state.
@@ -144,4 +145,19 @@ export function looksLikeYoutubeUrl(raw: string): boolean {
     return ALBUM_BROWSE_ID_RE.test(url.pathname.slice('/browse/'.length).split('/')[0] ?? '');
   }
   return false;
+}
+
+/**
+ * What a failed status poll means for the polling loop.
+ *
+ * A 404 is terminal: the server that answered has no such download, which is what
+ * happens after the engine restarts because its queue lives in memory. Asking
+ * again can only repeat the 404, so the tab must stop and say so rather than poll
+ * once a second forever while showing a track as 下載中. Everything else may be
+ * transient — an unreachable engine can come back, a 5xx can clear — so those
+ * keep polling.
+ */
+export function pollOutcome(err: unknown): 'stop' | 'retry' {
+  if (err instanceof ApiError && err.status === 404) return 'stop';
+  return 'retry';
 }
